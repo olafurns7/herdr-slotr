@@ -7,6 +7,12 @@ This file explains how to test slotr locally and how to publish a release.
 The integration tests use a fake systemd driven by Python 3.11+ stdlib.
 
 ```sh
+sh -n install.sh
+dash -n install.sh
+sh tests/install_sh_test.sh
+SH=dash dash tests/install_sh_test.sh
+sh -n scripts/release.sh
+sh scripts/notices.sh --check
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
@@ -31,7 +37,8 @@ sh scripts/release.sh VERSION
 sh scripts/release.sh VERSION --publish
 ```
 
-- VERSION must match the version in `Cargo.toml`.
+- VERSION must match the version in `Cargo.toml` and the `VERSION` line in
+  `install.sh`. A mismatch exits 2 before building.
 - The script refuses dirty trees, an existing local `vVERSION` tag, and
   other hosts, with exit 2.
 - Before building, `sh scripts/notices.sh --check` must confirm that the
@@ -42,7 +49,9 @@ sh scripts/release.sh VERSION --publish
   the script refuses builder paths or the login name in the binary strings
   or archive listing.
 - Assets in `dist/` are `slotr-VERSION-x86_64-unknown-linux-musl.tar.gz` and
-  its `.sha256` file. The archive holds three regular files in this order: `LICENSE`,
+  its `.sha256` file. The release also includes `install.sh` and
+  `config.example.toml` from the checkout, in both create and upload paths.
+  The archive holds three regular files in this order: `LICENSE`,
   `THIRD-PARTY-NOTICES`, and `slotr`, with numeric owner and group 0.
 - `--publish` explicitly creates a GitHub release with `gh`, targeting the
   exact local HEAD that was built. If the release already exists, it only

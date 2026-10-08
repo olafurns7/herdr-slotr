@@ -28,6 +28,11 @@ if [ "$version" != "$package_version" ]; then
     echo "slotr: VERSION must match Cargo.toml ($package_version)" >&2
     exit 2
 fi
+install_version=$(sed -n 's/^    VERSION=\([^ ]*\)$/\1/p' install.sh)
+if [ "$version" != "$install_version" ]; then
+    echo "slotr: VERSION must match install.sh ($install_version)" >&2
+    exit 2
+fi
 target=x86_64-unknown-linux-musl
 sh scripts/notices.sh --check
 cargo_home=${CARGO_HOME:-$HOME/.cargo}
@@ -50,8 +55,8 @@ done
 (cd dist && sha256sum "$asset" > "$asset.sha256")
 if [ "$publish" = --publish ]; then
     if gh release view "v$version" >/dev/null 2>&1; then
-        gh release upload "v$version" "dist/$asset" "dist/$asset.sha256"
+        gh release upload "v$version" "dist/$asset" "dist/$asset.sha256" install.sh config.example.toml
     else
-        gh release create "v$version" --target "$(git rev-parse HEAD)" "dist/$asset" "dist/$asset.sha256" --title "slotr $version" --notes "Linux x86_64 musl build."
+        gh release create "v$version" --target "$(git rev-parse HEAD)" "dist/$asset" "dist/$asset.sha256" install.sh config.example.toml --title "slotr $version" --notes "Linux x86_64 musl build."
     fi
 fi
