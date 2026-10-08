@@ -77,6 +77,13 @@ if name == 'systemd-run':
     with (root / 'launches').open('a') as log:
         log.write(json.dumps(args[:args.index('--')]) + '\n')
     cmd = args[args.index('--') + 1:]
+    if (root / 'detached').exists():
+        # Like real systemd-run --wait: the launcher waits; the service runs in its own session.
+        import subprocess
+        service = subprocess.Popen(cmd, start_new_session=True)
+        (root / unit).write_text(str(service.pid))
+        (root / 'launcher').write_text(str(os.getpid()))
+        sys.exit(service.wait())
     os.execv(cmd[0], cmd)
 if 'Version' in ' '.join(args):
     if (root / 'no-bus').exists():
@@ -228,7 +235,7 @@ class AdmissionTest(unittest.TestCase):
             threading.Event().wait(0.04)
         self.fail('condition timed out; logs: ' + ' '.join(p.read_text() for p in self.logs))
 
-    def start(self, label, *literal, campaign=None, lease=None, task='test-task', pane='test-pane'):
+    def start(self, label, *literal, campaign=None, lease=None, task='test-task', pane='test-pane', **popen):
         output = self.root / label
         log = self.root / (label + '.log')
         self.logs.append(log)
@@ -238,7 +245,7 @@ class AdmissionTest(unittest.TestCase):
                                       '--purpose', label, '--task', task, '--pane', pane,
                                       *(['--lease', lease] if lease else []), '--',
                                       sys.executable, '-c', WORKLOAD, str(output), *literal], env=self.env,
-                                     stdin=subprocess.DEVNULL, stdout=stream, stderr=stream)
+                                     stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, **popen)
         self.children.append(child)
         return child, output
 
@@ -770,6 +777,39 @@ class AdmissionTest(unittest.TestCase):
         holder.terminate()
         holder.wait(timeout=30)
         self.assertEqual(holder.returncode, 143, (self.root / 'holder.log').read_text()[-300:])
+
+    def test_sighup_frontend_stops_unit_and_releases_holder(self):
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        holder.send_signal(signal.SIGHUP)
+        holder.wait(timeout=30)
+        self.assertEqual(holder.returncode, 129, (self.root / 'holder.log').read_text()[-300:])
+        self.assertTrue(p1.with_suffix('.term').exists())
+        self.assertIsNone(self.running('holder'))
+        self.assertEqual(self.status()['pools']['runtime']['holders'], [])
+
+    def test_group_hup_after_launcher_exit_still_stops_detached_unit(self):
+        (self.runtime / 'detached').touch()
+        holder, p1 = self.start('holder', start_new_session=True)
+        self.admitted('holder', p1)
+        launcher = int((self.runtime / 'launcher').read_text())
+        os.kill(holder.pid, signal.SIGSTOP)           # the launcher handles the tab's HUP first
+        os.killpg(holder.pid, signal.SIGHUP)
+        self.wait(lambda: Path('/proc/%d/stat' % launcher).read_text().split()[2] == 'Z')
+        os.kill(holder.pid, signal.SIGCONT)
+        holder.wait(timeout=30)
+        self.assertEqual(holder.returncode, 129, (self.root / 'holder.log').read_text()[-300:])
+        self.assertTrue(p1.with_suffix('.term').exists())
+        self.assertEqual(self.status()['pools']['runtime']['holders'], [])
+
+    def test_inherited_hup_ignore_is_kept(self):
+        holder, p1 = self.start('holder', preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+        self.admitted('holder', p1)
+        holder.send_signal(signal.SIGHUP)
+        time.sleep(0.5)
+        self.assertIsNone(holder.poll())
+        self.assertFalse(p1.with_suffix('.term').exists())
+        self.assertIsNotNone(self.running('holder'))
 
     # --- lead's smoke: A overdue, A2 yielding (same campaign), one waiter B
     def lead_smoke(self, ignore_term=False):

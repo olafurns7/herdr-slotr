@@ -124,16 +124,38 @@ A warning hook can delay that supervisor by up to its timeout. Stop hooks run
 after TERM and alongside the grace timer, so a slow hook cannot delay TERM or
 KILL.
 
-To send both a task note and a pane prompt, write a small wrapper script that
-runs both commands and configure its argv as the single hook, for example:
+To wake the agent that asked for the run, prompt its pane:
 
 ```toml
-on_stop = ["/path/to/notify-both", "{task}", "{pane}", "slotr: stopped {run}: {reason}"]
+on_stop = ["herdr", "agent", "prompt", "{pane}", "slotr: {run} {reason}"]
 ```
 
-The script takes task, pane, and message as separate arguments and invokes
-`taskr note --as "$1" "$3"` followed by `herdr agent prompt "$2" --text "$3"`.
-The devbox example shows each command separately; neither integration is
-compiled in. The on-stop example includes a requeue template; replace PURPOSE
-and COMMAND with your original request, which slotr deliberately does not
+This form works for any task id on the host, needs no taskr environment, and
+fails harmlessly (a logged non-zero exit) when the pane is gone. The devbox
+example uses it for all three hooks.
+
+Closing the terminal tab that runs `slotr run` sends the client SIGHUP. The
+client stops its unit and exits 129, even when `systemd-run` exits on the same
+HUP first. The unit itself runs outside the tab and never sees that HUP, so
+only the `slotr run` client relays it. A client started under `nohup` keeps
+its inherited HUP ignore, and a client in another session gets no tab HUP;
+stop either with `slotr stop RUN`.
+
+If you also want a ledger note, use `taskr note` without `--as`:
+
+```toml
+on_stop = ["taskr", "note", "slotr: stopped {run}: {reason}"]
+```
+
+The unit forwards the caller's environment, so the note lands on the caller's
+own `TASKR_TASK` (it fails once that task is done). Do not use `taskr note --as {task}`: taskr accepts `--as`
+only for a root orchestrator on its own host, so the hook exits 6 whenever
+`--task` is a worker lane id or a root on another host.
+
+To send both, write a small wrapper script that runs both commands and
+configure its argv as the single hook, for example
+`["/path/to/notify-both", "{pane}", "slotr: stopped {run}: {reason}"]`, which
+invokes `herdr agent prompt "$1" "$2"` followed by `taskr note "$2"`.
+Neither integration is compiled in.
+The on-stop example includes a requeue template; replace PURPOSE and COMMAND with your original request, which slotr deliberately does not
 persist.

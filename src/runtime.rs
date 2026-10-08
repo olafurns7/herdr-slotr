@@ -287,10 +287,11 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
         tail
     });
     let mut stopped = false;
+    let mut stop_failed = false;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
+        // Cancellation is checked after try_wait, so a launcher that exits on the
+        // same group HUP cannot leave the unit running.
+        let exited = child.try_wait()?;
         if manager::cancelled() != 0
             && !stopped
             && state::read(&state::root()).is_ok_and(|s| {
@@ -302,13 +303,34 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
         {
             match manager::ctl(&["stop", "--no-block", &h.run]) {
                 Ok(output) if output.status.success() => stopped = true,
-                Ok(_) => {}
-                Err(error) => eprintln!("slotr: stop request: {error:#}"),
+                Ok(output) => {
+                    stop_failed = true;
+                    eprintln!(
+                        "slotr: stop request: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )
+                }
+                Err(error) => {
+                    stop_failed = true;
+                    eprintln!("slotr: stop request: {error:#}")
+                }
             }
+        }
+        if let Some(status) = exited {
+            break status;
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let tail = relay.join().unwrap_or_default();
+    // A unit that would not stop may hold the relay pipe open for ever.
+    let tail = if stop_failed && !stopped {
+        eprintln!(
+            "slotr: {} may still be running; run: slotr stop {}",
+            h.run, h.run
+        );
+        vec![]
+    } else {
+        relay.join().unwrap_or_default()
+    };
     let error = String::from_utf8_lossy(&tail).to_lowercase();
     let started = state::read(&state::root())
         .map(|s| {

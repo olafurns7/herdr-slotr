@@ -44,5 +44,6 @@ idle_cpu_ms_per_min = 100.0
 
 [hooks]
 on_admit = [] # argv arrays, never interpreted by a shell
+# on_admit = ["herdr", "agent", "prompt", "{pane}", "slotr: admitted {run}: {purpose}"]
 on_warn = []
 on_stop = []
