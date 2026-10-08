@@ -1,0 +1,45 @@
+# Example only; no machine or tool-specific values are compiled into slotr.
+[pools.runtime]
+slots = 2
+memory_gated = true
+evictable = true
+default_cost_mib = 7680
+max_lease = "4h"
+campaign_cap = 1
+[pools.runtime.kinds.dev-stack]
+cost_mib = 7680
+[pools.runtime.ports]
+base = 31000
+stride = 32
+probe = 7
+[pools.runtime.legacy_lock]
+path = "/tmp/trip-runtime.lock"
+mode = "shared"
+[admission]
+reserve_mib = 5120
+psi_full_avg60_max = 5.0
+load1_per_core_max = 0.0
+recovery_healthy_seconds = 30.0
+queue_poll_ms = 1000
+[watchdog]
+observe_locks = ["/tmp/trip-heavy.lock"]
+interval_ms = 2000
+on_pressure = "stop"
+stop_available_mib = 4000
+stop_available_samples = 2
+emergency_available_mib = 2000
+stop_psi_full_avg10_min = 20.0
+stop_psi_samples = 5
+term_grace_seconds = 15.0
+[lease]
+on_expiry = "stop"
+grace_seconds = 300.0
+waiter_min_wait_seconds = 300.0
+idle_release_minutes = 0.0
+idle_cpu_ms_per_min = 100.0
+[hooks]
+on_admit = ["taskr", "note", "--as", "{task}", "slotr: admitted {run} ({pool} slot {slot}, port {port_base}): {purpose}; events {events}"]
+# Alternative: on_admit = ["herdr", "agent", "prompt", "{pane}", "--text", "slotr: admitted {run}; {purpose}"]
+on_warn = ["taskr", "note", "--as", "{task}", "slotr: warning {run}: {reason}; campaign {campaign}; events {events}"]
+on_stop = ["taskr", "note", "--as", "{task}", "slotr: stopped {run}: {reason}; re-queue with slotr run --pool {pool} --campaign {campaign} --purpose PURPOSE -- COMMAND; events {events}"]
+# Alternative: on_stop = ["herdr", "agent", "prompt", "{pane}", "--text", "slotr: stopped {run}: {reason}; re-queue with slotr run --pool {pool} --campaign {campaign} --purpose PURPOSE -- COMMAND"]
