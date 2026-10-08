@@ -15,8 +15,9 @@ or export `GH_TOKEN`, then run the block again.
 `slotr setup: the release download failed`. Check that your `gh` account can
 see olafurns7/herdr-slotr and that release v0.1.0 exists.
 
-**Checksum mismatch.** In the quick install, `sha256sum -c` prints `FAILED`
-and the block stops before installing. The agent setup block prints
+**Checksum mismatch.** The quick install block stops before installing and
+prints no version line. The manual steps do not print `checksum OK`. The
+agent setup block prints
 `slotr setup: the checksum did not verify`. Do not install that file;
 download it again.
 
@@ -27,9 +28,10 @@ download it again.
 
 **Exit 75.** slotr stopped the workload automatically: memory pressure, an
 expired lease, a yield to another campaign, or idle release. The `on_stop`
-hook and `events.jsonl` (under `${XDG_STATE_HOME:-~/.local/state}/slotr/`)
-record the reason. slotr does not restart it. Queue it again with the
-original `slotr run` command when the work still needs it.
+hook, when one is configured, can send a note, and `events.jsonl` (under
+`${XDG_STATE_HOME:-~/.local/state}/slotr/`) normally records the reason.
+slotr does not restart it. Queue it again with the original `slotr run`
+command when the work still needs it.
 
 **`no systemd user bus here; run it in a terminal with a systemd user session`.**
 `run` and `stop` need a reachable systemd user bus. Sandboxed agent shells
@@ -49,7 +51,8 @@ under `kinds`.
 nonempty `--campaign` and `--purpose` text.
 
 **`cost exceeds MemTotal minus admission.reserve_mib`.** The request can
-never fit on this machine, so it is rejected before queueing. Lower `--cost`,
+never fit on this machine, so it is rejected before queueing. This check
+applies to memory-gated pools when MemTotal can be read. Lower `--cost`,
 choose another `--kind`, or lower `admission.reserve_mib`.
 
 **`expected duration, e.g. 4h, 300s or 0`.** A `--lease` or `max_lease`
@@ -63,7 +66,8 @@ stopped. `slotr status` lists them.
 shows each waiter's reason. The reasons are `fifo` (another ticket is ahead),
 `no_slot`, `campaign_cap`, `memory_budget`, `psi`, `load`, `ports_busy`,
 `legacy_lock` (with the holder's pid when known), and `recovery` (waiting
-after a stop). See [how-it-works.md](how-it-works.md).
+after a stop). `slotr status` alone also shows `ready`: the waiter is first
+and the admission checks pass right now. See [how-it-works.md](how-it-works.md).
 
 ## Config
 

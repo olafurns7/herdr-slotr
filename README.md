@@ -2,9 +2,11 @@
 
 slotr is a queue for heavy commands on one Linux machine, such as dev
 servers and test stacks. `slotr run` waits for a free slot and enough free
-memory, then runs your command in its own systemd user service. If memory
-runs low or a lease runs out, slotr stops the command instead of letting the
-machine run out of memory.
+memory, then runs your command in its own
+[systemd user service](docs/install.md#requirements). When memory runs low,
+slotr can stop the newest evictable command, and it can reclaim a run past
+its lease when another campaign waits. This lowers the risk of running out
+of memory but does not remove it.
 
 ## Quick install
 
@@ -14,7 +16,7 @@ olafurns7/herdr-slotr. Paste this whole block:
 ```sh
 d=$(mktemp -d) && a=slotr-0.1.0-x86_64-unknown-linux-musl.tar.gz &&
 gh release download v0.1.0 --repo olafurns7/herdr-slotr --pattern "$a" --pattern "$a.sha256" --dir "$d" &&
-(cd "$d" && sha256sum -c "$a.sha256") &&
+[ "$(sha256sum <"$d/$a" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$d/$a.sha256")" ] &&
 tar -xzf "$d/$a" -C "$d" slotr &&
 mkdir -p ~/.local/bin && install -m 0755 "$d/slotr" ~/.local/bin/slotr &&
 ~/.local/bin/slotr --version

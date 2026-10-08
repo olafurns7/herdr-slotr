@@ -14,7 +14,8 @@ the same checks as herdr-setup's installer, then adds a config file:
 4. Computes the archive's SHA-256 itself. The `.sha256` file must be exactly
    one line, `HASH  ASSETNAME` (or `HASH *ASSETNAME`), naming this asset.
    It does not use `sha256sum -c`, which would check whatever paths the file
-   names.
+   names. The quick install block also computes the hash itself, but compares
+   only the hash and does not check the line count or the name.
 5. Checks that the archive holds exactly one member, a regular file named
    `slotr`, and extracts it into an empty directory. A symlink is refused.
 6. Writes the binary to a temporary file in `~/.local/bin`, sets mode 0755,
@@ -26,7 +27,10 @@ the same checks as herdr-setup's installer, then adds a config file:
    config is never overwritten. The example equals the built-in defaults.
 9. Runs `slotr config check`, which prints `slotr: config OK`.
 
-A failed check prints `slotr setup:` and the reason, and the block exits 1.
+A check that uses `fail` prints `slotr setup:` and the reason, and the block
+exits 1. Any other command that fails (such as `tar`, `mkdir`, `mktemp`, the
+config download, or slotr itself) stops the block with its own message and
+exit status.
 The block installs even when v0.1.0 is already present.
 
 The block reads and writes `~/.config/slotr/config.toml`. If
@@ -42,7 +46,7 @@ access to olafurns7/herdr-slotr; sign in with `gh auth login` or export
 
 ## Using slotr in a fleet
 
-No host uses slotr by default. A host that runs heavy long-lived runtimes
+Configure slotr on each host where you want to use it. A host that runs heavy long-lived runtimes
 lists its pools in `~/.config/slotr/config.toml`. Write the wrapped command
 into the worker's brief:
 
@@ -51,8 +55,9 @@ slotr run --pool runtime --campaign <campaign> --purpose "<what for>" \
   --task <lead task id> --pane <lead pane> -- <command>
 ```
 
-- Exit 75 means slotr stopped the runtime (pressure, lease, or yield); the
-  note it leaves says why. Queue again when the work still needs it.
+- Exit 75 means slotr stopped the runtime (pressure, lease, or yield). A
+  configured `on_stop` hook can send a note, and `events.jsonl` normally
+  records the reason. Queue again when the work still needs it.
 - `slotr status` shows holders, the queue, and each waiter's wait reason.
 - A lead may wait for admission with
   `herdr pane wait-output <pane> --match 'slotr: admitted'`.

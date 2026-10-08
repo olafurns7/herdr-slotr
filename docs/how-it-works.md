@@ -12,7 +12,8 @@ MemAvailable - sum(max(0, holder.cost_mib - holder.anon_mib)) - request.cost_mib
 PSI full avg60 <= psi_full_avg60_max
 ```
 
-- Requests above MemTotal minus the reserve are rejected before queueing.
+- In a memory-gated pool, when MemTotal can be read, requests above MemTotal
+  minus the reserve are rejected before queueing.
 - Unknown anonymous memory gets zero resident credit; file cache gets none.
 - Missing memory or PSI data fails closed for admission.
 - The optional load gate compares load1 per logical core with

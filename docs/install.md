@@ -25,7 +25,9 @@ The quick install block in the README does these steps:
 
 1. Make a temporary directory with `mktemp -d`.
 2. Download both assets into it with `gh release download`.
-3. Check the archive against the `.sha256` file with `sha256sum -c`.
+3. Compute the archive's SHA-256 and compare it with the hash in the
+   `.sha256` file. The block stops here when they differ, whatever file name
+   the `.sha256` file states.
 4. Extract `slotr` and install it to `~/.local/bin/slotr` with mode 0755.
 5. Run `~/.local/bin/slotr --version`, which prints `slotr 0.1.0`.
 
@@ -35,12 +37,14 @@ The same steps by hand:
 d=$(mktemp -d)
 a=slotr-0.1.0-x86_64-unknown-linux-musl.tar.gz
 gh release download v0.1.0 --repo olafurns7/herdr-slotr --pattern "$a" --pattern "$a.sha256" --dir "$d"
-(cd "$d" && sha256sum -c "$a.sha256")
+[ "$(sha256sum <"$d/$a" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$d/$a.sha256")" ] && echo "checksum OK"
 tar -xzf "$d/$a" -C "$d" slotr
 mkdir -p ~/.local/bin
 install -m 0755 "$d/slotr" ~/.local/bin/slotr
 ~/.local/bin/slotr --version
 ```
+
+Go on only when the checksum line prints `checksum OK`.
 
 The last step uses the full path, so it works even when `~/.local/bin` is not
 on your `PATH`. Add `~/.local/bin` to `PATH` to type `slotr` alone.
