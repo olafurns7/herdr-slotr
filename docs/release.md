@@ -34,8 +34,16 @@ sh scripts/release.sh VERSION --publish
 - VERSION must match the version in `Cargo.toml`.
 - The script refuses dirty trees, an existing local `vVERSION` tag, and
   other hosts, with exit 2.
+- Before building, `sh scripts/notices.sh --check` must confirm that the
+  checked-in notices match the locked target dependencies. Run
+  `sh scripts/notices.sh` to refresh them from cached crate and toolchain
+  licence files after a dependency update.
+- The build remaps cargo home, rustup home, and checkout paths. After packing,
+  the script refuses builder paths or the login name in the binary strings
+  or archive listing.
 - Assets in `dist/` are `slotr-VERSION-x86_64-unknown-linux-musl.tar.gz` and
-  its `.sha256` file. The archive holds one file, `slotr`.
+  its `.sha256` file. The archive holds three regular files in this order: `LICENSE`,
+  `THIRD-PARTY-NOTICES`, and `slotr`, with numeric owner and group 0.
 - `--publish` explicitly creates a GitHub release with `gh`, targeting the
   exact local HEAD that was built. If the release already exists, it only
   attaches the assets to it and does not check or change its target.

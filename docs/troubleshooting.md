@@ -13,7 +13,7 @@ or export `GH_TOKEN`, then run the block again.
 
 **The download fails.** The agent setup block prints
 `slotr setup: the release download failed`. Check that your `gh` account can
-see olafurns7/herdr-slotr and that release v0.1.0 exists.
+see olafurns7/herdr-slotr and that release v0.1.1 exists.
 
 **Checksum mismatch.** The quick install block stops before installing and
 prints no version line. The manual steps do not print `checksum OK`. The
