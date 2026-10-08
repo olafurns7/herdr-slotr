@@ -200,7 +200,10 @@ pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && file.is_none() => {}
         Err(e) => return Err(e).with_context(|| format!("config {}", path.display())),
     }
-    for (key, raw) in env::vars().filter(|(k, _)| k.starts_with("SLOTR_") && k.contains("__")) {
+    for (key, raw) in env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .filter(|(k, _)| k.starts_with("SLOTR_") && k.contains("__"))
+    {
         let parts: Vec<_> = key[6..].split("__").map(str::to_lowercase).collect();
         let path = parts.join(".");
         let mut cursor = &mut value;
@@ -253,6 +256,10 @@ pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
     ensure!(
         cfg.admission.queue_poll_ms > 0,
         "config admission.queue_poll_ms: must be positive"
+    );
+    ensure!(
+        cfg.watchdog.term_grace_seconds > 0.0,
+        "config watchdog.term_grace_seconds: must be positive"
     );
     ensure!(
         cfg.watchdog.interval_ms > 0,

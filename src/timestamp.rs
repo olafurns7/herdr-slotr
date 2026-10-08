@@ -14,36 +14,68 @@ fn parse(value: &str) -> anyhow::Result<f64> {
 }
 #[cfg(target_os = "linux")]
 pub mod required {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error, ser::Error as _};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
     pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&super::format(*value).map_err(S::Error::custom)?)
+        serializer.serialize_f64(*value)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
-        super::parse(&String::deserialize(deserializer)?).map_err(D::Error::custom)
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Boot(f64),
+            Wall(String),
+        }
+        match Stored::deserialize(deserializer)? {
+            Stored::Boot(value) => Ok(value),
+            Stored::Wall(value) => super::parse(&value)
+                .map(|wall| crate::manager::now() + wall - crate::manager::wall_now())
+                .map_err(D::Error::custom),
+        }
     }
 }
 #[cfg(target_os = "linux")]
 pub mod optional {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::Error as _};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error> {
-        value
-            .map(super::format)
-            .transpose()
-            .map_err(S::Error::custom)?
-            .serialize(serializer)
+        value.serialize(serializer)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<f64>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .as_deref()
-            .map(super::parse)
-            .transpose()
-            .map_err(D::Error::custom)
+        #[derive(Deserialize)]
+        struct Stored(#[serde(with = "super::required")] f64);
+        Ok(Option::<Stored>::deserialize(deserializer)?.map(|v| v.0))
     }
 }
 #[test]
 fn utc_milliseconds() {
     assert_eq!(format(0.0).unwrap(), "1970-01-01T00:00:00.000Z");
     assert_eq!(format(1.234).unwrap(), "1970-01-01T00:00:01.234Z");
+}
+
+#[cfg(target_os = "linux")]
+pub fn display(value: &mut serde_json::Value) -> anyhow::Result<()> {
+    if let Some(map) = value.as_object_mut() {
+        for key in [
+            "since",
+            "seen_at",
+            "admitted_at",
+            "lease_expires_at",
+            "warned_at",
+            "stopping_at",
+            "idle_since",
+            "cpu_sample_at",
+            "at",
+        ] {
+            if let Some(seconds) = map.get(key).and_then(serde_json::Value::as_f64) {
+                map.insert(
+                    key.into(),
+                    serde_json::json!(format(
+                        crate::manager::wall_now() + seconds - crate::manager::now()
+                    )?),
+                );
+            }
+        }
+    }
+    Ok(())
 }

@@ -14,14 +14,19 @@ pub struct Request {
     pub pool: String,
     pub campaign: String,
     pub purpose: String,
+    #[serde(default)]
     pub task: String,
+    #[serde(default)]
     pub pane: String,
     pub cwd: String,
     pub cost_mib: u64,
     pub lease_seconds: f64,
     #[serde(with = "crate::timestamp::required")]
     pub since: f64,
+    #[serde(default)]
+    pub seen_at: f64,
     // A consumed stop claim stays with this ticket, preventing eviction cascades.
+    #[serde(default)]
     pub stop_claimed_by: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -31,21 +36,29 @@ pub struct Holder {
     pub run: String,
     pub admit_seq: u64,
     pub slot: u32,
+    #[serde(default)]
     pub port_base: Option<u32>,
+    #[serde(default)]
     pub port_end: Option<u32>,
     #[serde(with = "crate::timestamp::required")]
     pub admitted_at: f64,
-    #[serde(with = "crate::timestamp::optional")]
+    #[serde(default, with = "crate::timestamp::optional")]
     pub lease_expires_at: Option<f64>,
+    #[serde(default)]
     pub started: bool,
-    #[serde(with = "crate::timestamp::optional")]
+    #[serde(default, with = "crate::timestamp::optional")]
+    pub stopping_at: Option<f64>,
+    #[serde(default, with = "crate::timestamp::optional")]
     pub warned_at: Option<f64>,
+    #[serde(default)]
     pub warned_for: Option<u64>,
+    #[serde(default)]
     pub warned_waiters: Vec<u64>,
-    #[serde(with = "crate::timestamp::optional")]
+    #[serde(default, with = "crate::timestamp::optional")]
     pub idle_since: Option<f64>,
+    #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
-    #[serde(with = "crate::timestamp::optional")]
+    #[serde(default, with = "crate::timestamp::optional")]
     pub cpu_sample_at: Option<f64>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,8 +75,9 @@ pub struct State {
     pub admit_seq: u64,
     pub holders: Vec<Holder>,
     pub queue: Vec<Request>,
+    #[serde(default)]
     pub last_stop: Option<StopRecord>,
-    #[serde(with = "crate::timestamp::optional")]
+    #[serde(default, with = "crate::timestamp::optional")]
     pub healthy_since: Option<f64>,
 }
 impl Default for State {
@@ -133,11 +147,8 @@ pub fn transaction<T>(f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
 }
 pub fn ticket_live(seq: u64) -> bool {
     match File::open(root().join(format!("ticket-{seq}"))) {
-        Ok(f) => matches!(
-            flock(&f, FlockOperation::NonBlockingLockShared),
-            Err(rustix::io::Errno::WOULDBLOCK)
-        ),
-        Err(_) => false,
+        Ok(f) => !matches!(flock(&f, FlockOperation::NonBlockingLockShared), Ok(())),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
 pub fn clean_tickets(s: &State) -> Result<()> {

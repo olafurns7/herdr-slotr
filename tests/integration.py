@@ -30,6 +30,29 @@ if lock_path.exists():
                 if len(fields) > 5 and fields[1] == 'FLOCK' and fields[4] == str(os.getppid()) and fields[5].endswith(':' + str(lock_path.stat().st_ino)):
                     print('blocking subprocess under state.lock', file=sys.stderr)
                     sys.exit(9)
+
+if pathlib.Path(sys.argv[0]).name == 'systemctl':
+    if 'is-active' in args and (root / 'ctl-fail').exists():
+        print('boom', file=sys.stderr)
+        sys.exit(1)
+    if 'stop' in args and '--no-block' not in args:
+        # Real `systemctl stop` returns only when the stop job has finished.
+        import time
+        try:
+            pid = int((root / args[-1]).read_text())
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            sys.exit(0)
+        while True:
+            try:
+                os.kill(pid, 0)
+                if pathlib.Path('/proc/%s/stat' % pid).read_text().split()[2] == 'Z':
+                    break
+            except OSError:
+                break
+            time.sleep(0.02)
+        sys.exit(0)
+
 name = pathlib.Path(sys.argv[0]).name
 if name == 'taskr':
     with (root / 'notes').open('a') as log:
@@ -48,7 +71,7 @@ if name == 'systemd-run':
     unit = args[args.index('--unit') + 1]
     if (root / 'collision').exists():
         (root / 'collision').unlink()
-        print('Unit already exists', file=sys.stderr)
+        print('Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.' % unit, file=sys.stderr)
         sys.exit(1)
     (root / unit).write_text(str(os.getpid()))
     with (root / 'launches').open('a') as log:
@@ -84,7 +107,10 @@ path = pathlib.Path(sys.argv[1])
 path.write_text(json.dumps(dict(pid=os.getpid(), slot=os.environ['SLOTR_SLOT'],
                                base=os.environ['SLOTR_PORT_BASE'], run=os.environ['SLOTR_RUN'],
                                literal=sys.argv[2:])))
-signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+def terminated(s, f):
+    path.with_suffix(".term").write_text("TERM")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN if "--ignore-term" in sys.argv[2:] else terminated)
 while True:
     time.sleep(0.1)
 '''
@@ -123,7 +149,7 @@ class AdmissionTest(unittest.TestCase):
         for base in range(24000, 30000, 64):
             with contextlib.ExitStack() as stack:
                 try:
-                    for port in range(base, base + 64):
+                    for port in range(base, base + 128):
                         stack.enter_context(socket.socket()).bind(('127.0.0.1', port))
                     return base
                 except OSError:
@@ -132,7 +158,7 @@ class AdmissionTest(unittest.TestCase):
 
     def write_config(self):
         cfg = dict(pools=dict(runtime=dict(slots=self.cfg.get("runtime_slots", 2),
-                   memory_gated=True, evictable=self.cfg.get("evictable", True),
+                   memory_gated=self.cfg.get("memory_gated", True), evictable=self.cfg.get("evictable", True),
                    default_cost_mib=7680, max_lease=self.cfg.get("max_lease", "4h"),
                    campaign_cap=self.cfg.get("campaign_cap", 1),
                    ports=dict(self.cfg["ports"], probe=7),
@@ -166,7 +192,7 @@ class AdmissionTest(unittest.TestCase):
         (self.root / "config/slotr/config.toml").write_text("\n".join(lines) + "\n")
 
     def set_stats(self, available, avg10=0, avg60=0):
-        for path, text in ((self.proc / 'meminfo', f'MemAvailable: {available * 1024} kB\n'),
+        for path, text in ((self.proc / 'meminfo', f'MemTotal: {self.cfg.get("total_mib", 65536) * 1024} kB\nMemAvailable: {available * 1024} kB\n'),
                            (self.proc / 'pressure/memory', f'some avg10=0 avg60=0 avg300=0 total=0\nfull avg10={avg10} avg60={avg60} avg300=0 total=0\n'),
                            (self.proc / 'loadavg', '99.0 0 0 1/1 1\n')):
             pending = path.with_suffix('.tmp')
@@ -683,6 +709,432 @@ class AdmissionTest(unittest.TestCase):
         result = self.invoke("status", "--json", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(json.loads(result.stdout)["stats"]["load1"], 99.0)
+
+
+    def pause(self, seconds):
+        subprocess.run([sys.executable, '-c', 'import time; time.sleep(%r)' % seconds], check=True)
+
+    def notes(self):
+        path = self.runtime / 'notes'
+        return [json.loads(l)['args'] for l in path.read_text().splitlines()] if path.exists() else []
+
+    # --- item 1/2: wrong stop and lost queue place on a manager or state error
+    def test_probe_p01_manager_error_does_not_kill_holder_or_drop_waiter(self):
+        self.cfg['runtime_slots'] = 1
+        self.write_config()
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        waiter, _ = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        (self.runtime / 'ctl-fail').touch()          # one failing `systemctl is-active`
+        self.pause(1.0)
+        (self.runtime / 'ctl-fail').unlink()
+        seen = dict(holder_rc=holder.poll(), waiter_rc=waiter.poll(), stop_events=len(self.events('stop')),
+                    on_stop_hook_runs=len(self.notes()), holder_log=(self.root / 'holder.log').read_text().strip().splitlines()[-1:],
+                    waiter_log=(self.root / 'waiter.log').read_text().strip().splitlines()[-1:])
+        self.assertEqual((seen['holder_rc'], seen['waiter_rc']), (None, None), seen)
+
+    def test_probe_p02_unreadable_state_does_not_kill_holder(self):
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        state = self.runtime / 'slotr/state.json'
+        good = state.read_bytes()
+        pending = state.with_suffix('.probe')
+        pending.write_text('{broken')
+        pending.replace(state)
+        self.pause(1.0)
+        rc = holder.poll()
+        pending.write_bytes(good)
+        pending.replace(state)
+        self.assertIsNone(rc, 'holder workload was terminated: rc=%s' % rc)
+
+    # --- item 2: `slotr stop` and a signalled frontend against a synchronous `systemctl stop`
+    def test_probe_p03_stop_command_reports_success(self):
+        self.cfg['term_grace_seconds'] = 6          # default is 15; anything above ctl's 5 s shows it
+        self.write_config()
+        (self.runtime / 'sync-stop').touch()
+        holder, p1 = self.start('holder')
+        h = self.admitted('holder', p1)
+        began = time.monotonic()
+        result = subprocess.run([str(TOOL), 'stop', h['run']], env=self.env, capture_output=True, text=True, timeout=40)
+        took = time.monotonic() - began
+        holder.wait(timeout=20)
+        self.assertEqual(result.returncode, 0, 'after %.1fs: %s' % (took, result.stderr.strip()))
+
+    def test_probe_p04_sigterm_frontend_relays_143(self):
+        self.cfg['term_grace_seconds'] = 6
+        self.write_config()
+        (self.runtime / 'sync-stop').touch()
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        holder.terminate()
+        holder.wait(timeout=30)
+        self.assertEqual(holder.returncode, 143, (self.root / 'holder.log').read_text()[-300:])
+
+    # --- lead's smoke: A overdue, A2 yielding (same campaign), one waiter B
+    def lead_smoke(self, ignore_term=False):
+        self.configure_clock()
+        self.cfg['on_warn'] = ['taskr', 'note', '{task}', 'WARN', '{run}', '{reason}']
+        self.write_config()
+        self.set_stats(40000)
+        first, p1 = self.start('first', *(['--ignore-term'] if ignore_term else []), campaign='A', lease='1s')
+        self.wait(p1.exists)
+        second, p2 = self.start('second', campaign='A')
+        self.wait(p2.exists)
+        self.advance(10)                              # A is overdue before B arrives; A2 yields once B waits
+        _, waiter = self.start('waiter', campaign='B')
+        self.wait(lambda: bool(self.status()['queue']))
+        return first, second, waiter
+
+    def test_probe_p05_one_waiter_one_warn(self):
+        first, second, waiter = self.lead_smoke()
+        self.wait(lambda: first.poll() is not None)
+        self.wait(waiter.exists)
+        self.assertEqual(first.returncode, 75)
+        self.assertIsNone(second.poll())
+        warns = [(e['run'], e['reason']) for e in self.events('warn')]
+        hooks = [a for a in self.notes() if 'WARN' in a]
+        self.assertEqual(len(warns), 1, 'warn events: %s; on_warn hook runs: %s' % (warns, hooks))
+        self.assertEqual(len(hooks), 1)
+
+    def test_probe_p06_status_shows_stopping_during_term_grace(self):
+        self.cfg['term_grace_seconds'] = 1.5
+        first, second, waiter = self.lead_smoke(ignore_term=True)
+        self.wait(lambda: bool(self.events('stop')))
+        run = self.events('stop')[0]['run']
+        seen = [s.get('state') for s in self.status()['slots'] if s.get('run') == run]
+        self.assertEqual(seen, ['stopping'])
+
+    def test_probe_p07_one_warn_while_fit_flaps_during_grace(self):
+        self.configure_clock()
+        self.cfg['grace'] = 30
+        self.write_config()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        _, waiter = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.wait(lambda: bool(self.events('warn')))
+        for _ in range(5):                            # the waiter stops fitting for one sample, then fits again
+            self.set_stats(10000)
+            self.pause(0.25)
+            self.set_stats(40000)
+            self.pause(0.25)
+        warns = [e['reason'] for e in self.events('warn')]
+        self.assertIsNone(old.poll())
+        self.assertEqual(len(warns), 1, 'warn events %s, cancels %d' % (warns, len(self.events('warn_cancelled'))))
+
+    # --- item 1: a stop for a waiter that cannot admit itself
+    def test_probe_p08_frozen_head_waiter_earns_no_stop(self):
+        self.configure_clock()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        waiter, out = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        os.kill(waiter.pid, signal.SIGSTOP)           # Ctrl-Z in the waiter's pane
+        try:
+            self.advance(10)
+            self.pause(3.0)
+            self.assertIsNone(old.poll(), 'holder stopped (rc=%s) for a frozen waiter; waiter admitted=%s' % (old.returncode, out.exists()))
+        finally:
+            os.kill(waiter.pid, signal.SIGCONT)
+
+    # --- item 4: the stop side ignores the campaign cap
+    def test_probe_p09_no_eviction_for_a_campaign_already_at_cap(self):
+        self.configure_clock()
+        self.set_stats(40000)
+        a, p1 = self.start('a1', campaign='A', lease='1s')
+        self.wait(p1.exists)
+        b, p2 = self.start('b1', campaign='B')
+        self.wait(p2.exists)
+        _, b2 = self.start('b2', campaign='B')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.pause(3.0)
+        self.assertIsNone(a.poll(), 'A stopped (rc=%s) so that B holds both slots; b2 admitted=%s' % (a.returncode, b2.exists()))
+
+    def test_probe_p10_free_slot_with_two_mutually_capped_waiters(self):
+        self.cfg['runtime_slots'] = 3
+        self.write_config()
+        self.set_stats(60000)
+        _, p1 = self.start('a1', campaign='A')
+        self.wait(p1.exists)
+        _, p2 = self.start('b1', campaign='B')
+        self.wait(p2.exists)
+        self.set_stats(10000)
+        _, a2 = self.start('a2', campaign='A')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        _, b2 = self.start('b2', campaign='B')
+        self.wait(lambda: len(self.status()['queue']) == 2)
+        self.set_stats(60000)
+        self.pause(1.0)
+        reasons = [q['wait_reason'] for q in self.status()['queue']]
+        self.assertTrue(a2.exists() or b2.exists(), 'one slot free, nobody admitted; wait reasons %s' % reasons)
+
+    # --- item 1 control: on_pressure warn/off (expected to hold)
+    def pressure(self, policy):
+        self.env['SLOTR_WATCHDOG__ON_PRESSURE'] = policy
+        self.cfg['on_warn'] = ['taskr', 'note', '{task}', 'WARN', '{reason}']
+        self.write_config()
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        self.set_stats(1000)
+        self.pause(0.8)
+        self.assertIsNone(holder.poll())
+        self.assertEqual(self.events('stop'), [])
+        return len(self.events('warn'))
+
+    def test_probe_p11_on_pressure_warn_never_stops_and_warns_once(self):
+        self.assertEqual(self.pressure('warn'), 1)
+
+    def test_probe_p12_on_pressure_off_never_stops_or_warns(self):
+        self.assertEqual(self.pressure('off'), 0)
+
+    # --- item 6 / 2
+    def test_probe_p13_workload_stderr_cannot_fake_a_bus_error(self):
+        code = "import sys; print('worker: Failed to connect to message bus, retrying', file=sys.stderr); sys.exit(0)"
+        result = self.invoke('run', '--kind', 'dev-stack', '--', sys.executable, '-c', code)
+        self.assertEqual(result.returncode, 0, result.stderr.strip().splitlines()[-1:])
+
+    def test_probe_p14_non_utf8_environment_value(self):
+        env = {os.fsencode(k): os.fsencode(v) for k, v in self.env.items()}
+        env[b'LEGACY_LATIN1'] = b'caf\xe9'
+        result = subprocess.run([str(TOOL), 'config', 'show'], env=env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace').strip()[:200])
+
+    def test_probe_p15_queued_waiter_leaves_the_legacy_lock_free(self):
+        self.set_stats(10000)                         # nothing runs; the waiter queues on memory_budget
+        self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        got = 0
+        with open(self.cfg['legacy_runtime_lock'], 'a') as lock:
+            for _ in range(100):
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    got += 1
+                except BlockingIOError:
+                    pass
+                self.pause(0.01)
+        self.assertGreater(got, 50, 'an exclusive legacy user got the lock in %d of 100 tries while only a waiter existed' % got)
+
+    def test_probe_p16_collision_retry_with_the_systemd_255_message(self):
+        (self.runtime / 'collision').touch()
+        child, output = self.start('collision')
+        try:
+            self.wait(output.exists, timeout=3)
+        except AssertionError:
+            state = json.loads((self.runtime / 'slotr/state.json').read_text())
+            self.fail('no retry: frontend rc=%s, holder records left=%s, log=%s' % (
+                child.poll(), [(h['run'], h['started']) for h in state['holders']], (self.root / 'collision.log').read_text().strip()[-200:]))
+
+    def test_pressure_stop_precedes_slow_hook(self):
+        self.env["SLOTR_WATCHDOG__ON_PRESSURE"] = "stop"
+        self.cfg["on_stop"] = [sys.executable, "-c", "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); time.sleep(0.8)", str(self.root / "hook-started")]
+        self.write_config()
+        holder, output = self.start("holder")
+        self.admitted("holder", output)
+        self.set_stats(1000)
+        self.wait(lambda: (self.root / "hook-started").exists())
+        self.wait(lambda: output.with_suffix(".term").exists(), timeout=0.5)
+        self.assertIsNone(holder.poll(), "hook must still be running when TERM is observed")
+        holder.wait(timeout=5)
+        self.assertEqual(holder.returncode, 75)
+
+    def test_event_write_failure_does_not_kill_workload(self):
+        self.env["SLOTR_WATCHDOG__ON_PRESSURE"] = "warn"
+        holder, output = self.start("holder")
+        self.admitted("holder", output)
+        self.env["SLOTR_WATCHDOG__ON_PRESSURE"] = "warn"
+        # Fill the event path with a directory; all future event appends fail.
+        path = self.root / "state/slotr/events.jsonl"
+        path.unlink()
+        path.mkdir()
+        self.set_stats(1000)
+        self.pause(0.5)
+        self.assertIsNone(holder.poll())
+        path.rmdir()
+
+    def test_cleanup_failure_preserves_workload_exit(self):
+        code = "import pathlib,os,sys; pathlib.Path(os.environ['XDG_RUNTIME_DIR']+'/slotr/state.json').write_text('{broken'); sys.exit(17)"
+        result = self.invoke("run", "--kind", "dev-stack", "--", sys.executable, "-c", code)
+        self.assertEqual(result.returncode, 17, result.stderr)
+
+    def test_failed_start_removes_own_holder(self):
+        stub = (self.bin / "systemd-run").read_text()
+        (self.bin / "systemd-run").write_text(stub.replace("os.execv(cmd[0], cmd)", "sys.exit(23)"))
+        result = self.invoke("run", "--kind", "dev-stack", "--", "true")
+        self.assertEqual(result.returncode, 23, result.stderr)
+        state = json.loads((self.runtime / "slotr/state.json").read_text())
+        self.assertEqual(state["holders"], [])
+
+    def test_environment_names_only_and_invalid_name_skipped(self):
+        self.env["BASH_FUNC_x%%"] = "() { :; }"
+        child, output = self.start("holder")
+        self.admitted("holder", output)
+        flags = json.loads((self.runtime / "launches").read_text().splitlines()[0])
+        env_flags = [s for s in flags if s.startswith("--setenv=")]
+        self.assertIn("--setenv=SECRET_SENTINEL", env_flags)
+        self.assertFalse(any("private-test-value" in s for s in flags))
+        self.assertFalse(any("BASH_FUNC" in s for s in env_flags))
+        self.assertTrue(all("=" not in s[len("--setenv="):] for s in env_flags))
+        self.assertIn("--property=TimeoutStopSec=5.12", flags)
+
+    def test_boottime_state_and_optional_field_upgrade(self):
+        holder, output = self.start("holder")
+        self.admitted("holder", output)
+        path = self.runtime / "slotr/state.json"
+        # Freeze only owned processes while editing a snapshot, then continue.
+        state = json.loads(path.read_text())
+        supervisor_pid = int((self.runtime / state["holders"][0]["run"]).read_text())
+        os.kill(supervisor_pid, signal.SIGSTOP)
+        try:
+            state = json.loads(path.read_text())
+            h = state["holders"][0]
+            self.assertIsInstance(h["admitted_at"], (float,int))
+            self.assertLess(abs(h["admitted_at"] - time.clock_gettime(time.CLOCK_BOOTTIME)), 2)
+            for key in ["stopping_at", "warned_at", "warned_for", "warned_waiters", "idle_since", "cpu_usage_usec", "cpu_sample_at", "lease_expires_at"]:
+                h.pop(key, None)
+            pending = path.with_suffix(".upgrade")
+            pending.write_text(json.dumps(state))
+            pending.replace(path)
+            view = self.status()["slots"][0]
+            self.assertTrue(view["admitted_at"].endswith("Z"))
+        finally:
+            os.kill(supervisor_pid, signal.SIGCONT)
+        self.pause(0.3)
+        self.assertIsNone(holder.poll())
+
+    def test_memory_ungated_pool_ignores_recovery_and_missing_psi(self):
+        self.set_stats(30000)
+        holder, output = self.start("holder")
+        self.admitted("holder", output)
+        self.set_stats(1000)
+        self.wait(lambda: holder.poll() is not None)
+        self.assertEqual(holder.returncode, 75)
+        self.cfg["memory_gated"] = False
+        self.cfg["evictable"] = False
+        self.write_config()
+        (self.proc / "pressure/memory").unlink()
+        _, second = self.start("ungated")
+        self.wait(second.exists)
+
+    def test_impossible_cost_rejected_before_queue(self):
+        result = self.invoke("run", "--cost", "65536", "--", "true")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("MemTotal", result.stderr)
+        self.assertFalse((self.runtime / "slotr").exists())
+
+    def test_ipv6_busy_port_is_not_admitted(self):
+        try:
+            occupied = socket.socket(socket.AF_INET6)
+            occupied.bind(("::1", self.cfg["ports"]["base"]))
+        except OSError as error:
+            self.skipTest(str(error))
+        with occupied:
+            _, output = self.start("ipv6")
+            h = self.admitted("ipv6", output)
+            self.assertEqual(h["slot"], 1)
+
+    def test_zero_term_grace_rejected(self):
+        self.cfg["term_grace_seconds"] = 0
+        self.write_config()
+        result = self.invoke("config", "check")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("watchdog.term_grace_seconds", result.stderr)
+
+    def test_background_hook_pipe_writer_does_not_delay_supervisor(self):
+        self.cfg["on_admit"] = [sys.executable, "-c", "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)'])"]
+        self.write_config()
+        self.env["SLOTR_WATCHDOG__ON_PRESSURE"] = "stop"
+        holder, output = self.start("holder")
+        self.admitted("holder", output)
+        self.set_stats(1000)
+        self.wait(lambda: holder.poll() is not None, timeout=1.5)
+        self.assertEqual(holder.returncode, 75)
+        # Wait for the short-lived owned hook descendant before removing scratch dirs.
+        self.pause(2)
+
+
+    def test_warn_claim_cleared_when_holder_exits_without_a_stop(self):
+        self.configure_clock()
+        self.cfg["grace"] = 0.7
+        self.write_config()
+        self.set_stats(40000)
+        first, p1 = self.start("first", lease="1s")
+        self.wait(p1.exists)
+        second, p2 = self.start("second", lease="1s")
+        self.wait(p2.exists)
+        _, waiter = self.start("waiter")
+        self.wait(lambda: bool(self.status()["queue"]))
+        self.advance(10)
+        self.wait(lambda: bool(self.events("warn")))
+        self.set_stats(19000)
+        first.terminate()
+        first.wait(timeout=3)
+        self.wait(lambda: second.poll() is not None)
+        self.assertEqual(second.returncode, 75)
+        self.wait(waiter.exists)
+        self.assertEqual(len(self.events("stop")), 1)
+        self.assertTrue(self.events("stop")[0]["run"].endswith("-2"))
+
+    def test_unreadable_live_ticket_is_retained(self):
+        self.set_stats(10000)
+        waiter, _ = self.start("waiter")
+        q = self.wait(lambda: self.status()["queue"])
+        ticket = self.runtime / "slotr" / ("ticket-" + str(q[0]["enqueue_seq"]))
+        ticket.chmod(0)
+        try:
+            self.assertEqual(len(self.status()["queue"]), 1)
+            self.assertIsNone(waiter.poll())
+        finally:
+            ticket.chmod(0o600)
+
+    def test_ticket_creation_does_not_block_under_state_lock(self):
+        root = self.runtime / "slotr"
+        root.mkdir()
+        with (root / "ticket-1").open("w") as ticket:
+            fcntl.flock(ticket, fcntl.LOCK_EX)
+            result = self.invoke("run", "--kind", "dev-stack", "--", "true")
+            self.assertEqual(result.returncode, 2)
+        with (root / "state.lock").open("r") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_legacy_wall_timestamp_state_remains_readable(self):
+        holder, output = self.start("holder")
+        h = self.admitted("holder", output)
+        supervisor = int((self.runtime / h["run"]).read_text())
+        os.kill(supervisor, signal.SIGSTOP)
+        try:
+            path = self.runtime / "slotr/state.json"
+            state = json.loads(path.read_text())
+            for key in ["since", "admitted_at", "lease_expires_at"]:
+                state["holders"][0][key] = h[key]
+            pending = path.with_suffix(".legacy")
+            pending.write_text(json.dumps(state))
+            pending.replace(path)
+            self.assertEqual(self.status()["slots"][0]["state"], "running")
+        finally:
+            os.kill(supervisor, signal.SIGCONT)
+        self.pause(0.3)
+        self.assertIsNone(holder.poll())
+
+    def test_release_version_must_match_package(self):
+        # Only the read-only git preflight is stubbed. A mismatch exits before
+        # cargo or gh can run; no tags, commits or releases are created.
+        git = self.bin / "git"
+        git.write_text("#!/bin/sh\ncase \"$1:$2\" in status:--porcelain) exit 0;; rev-parse:--verify) exit 1;; *) exit 9;; esac\n")
+        git.chmod(0o755)
+        result = subprocess.run(["sh", "scripts/release.sh", "9999.0.0"], env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("VERSION must match Cargo.toml", result.stderr)
+
 
 
 if __name__ == '__main__':

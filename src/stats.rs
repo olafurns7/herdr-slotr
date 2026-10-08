@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::{env, fs, path::PathBuf};
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct Stats {
+    pub total_mib: Option<f64>,
     pub available_mib: Option<f64>,
     pub psi_full_avg10: Option<f64>,
     pub psi_full_avg60: Option<f64>,
@@ -27,14 +28,17 @@ pub fn read() -> Stats {
     {
         let root = PathBuf::from(setting("PROC_ROOT", "/proc"));
         if let Ok(text) = fs::read_to_string(root.join("meminfo")) {
-            out.available_mib = text
-                .lines()
-                .find_map(|l| {
-                    l.strip_prefix("MemAvailable:")
-                        .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
-                })
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .map(|v| v / 1024.0);
+            let mib = |key: &str| {
+                text.lines()
+                    .find_map(|l| {
+                        l.strip_prefix(key)
+                            .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+                    })
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| v / 1024.0)
+            };
+            out.available_mib = mib("MemAvailable:");
+            out.total_mib = mib("MemTotal:");
         }
         if let Ok(text) = fs::read_to_string(root.join("pressure/memory"))
             && let Some(line) = text.lines().find(|l| l.starts_with("full "))

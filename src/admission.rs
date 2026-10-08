@@ -43,17 +43,21 @@ pub fn recovery(s: &State, sample: &Stats, cfg: &Config, now: f64) -> bool {
             || now - stop.at < cfg.admission.recovery_healthy_seconds
     })
 }
+pub fn campaign_held(s: &State, pool: &str, campaign: &str) -> usize {
+    s.holders
+        .iter()
+        .filter(|h| h.request.pool == pool && h.request.campaign == campaign)
+        .count()
+}
 pub fn cap_blocked(s: &State, q: &Request, cfg: &Config) -> bool {
     let pool = &cfg.pools[&q.pool];
     pool.campaign_cap > 0
-        && s.holders
-            .iter()
-            .filter(|h| h.request.pool == q.pool && h.request.campaign == q.campaign)
-            .count()
-            >= pool.campaign_cap as usize
-        && s.queue
-            .iter()
-            .any(|w| w.pool == q.pool && w.campaign != q.campaign)
+        && campaign_held(s, &q.pool, &q.campaign) >= pool.campaign_cap as usize
+        && s.queue.iter().any(|w| {
+            w.pool == q.pool
+                && w.campaign != q.campaign
+                && campaign_held(s, &w.pool, &w.campaign) < pool.campaign_cap as usize
+        })
 }
 pub fn head<'a>(s: &'a State, pool: &str, cfg: &Config) -> Option<&'a Request> {
     s.queue
@@ -73,9 +77,6 @@ pub fn decide(
     if cap_blocked(s, q, cfg) {
         return (None, Some("campaign_cap"));
     }
-    if recovery(s, sample, cfg, now) {
-        return (None, Some("recovery"));
-    }
     let slots: Vec<_> = (0..pool.slots)
         .filter(|slot| {
             !s.holders
@@ -87,6 +88,9 @@ pub fn decide(
         return (None, Some("no_slot"));
     }
     if pool.memory_gated {
+        if recovery(s, sample, cfg, now) {
+            return (None, Some("recovery"));
+        }
         if sample.available_mib.is_none_or(|v| {
             v - outstanding(s, obs) - (q.cost_mib as f64) < cfg.admission.reserve_mib as f64
         }) {
@@ -144,7 +148,9 @@ pub fn overdue(h: &Holder, now: f64) -> bool {
     h.lease_expires_at.is_some_and(|t| now >= t)
 }
 pub fn holder_state(h: &Holder, s: &State, cfg: &Config, now: f64) -> &'static str {
-    if h.warned_at.is_some() {
+    if h.stopping_at.is_some() {
+        "stopping"
+    } else if h.warned_at.is_some() {
         "warned"
     } else if yielding(h, s, &cfg.pools[&h.request.pool]) {
         "yielding"

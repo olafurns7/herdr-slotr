@@ -100,7 +100,7 @@ A legacy lock requires a path; its mode defaults to `shared`.
 | `emergency_available_mib` | `2000` | Stop below this after one sample |
 | `stop_psi_full_avg10_min` | `20.0` | Stop at or above this PSI avg10 after N samples |
 | `stop_psi_samples` | `5` | Positive consecutive PSI sample count |
-| `term_grace_seconds` | `15.0` | TERM-to-KILL grace, also systemd TimeoutStopSec |
+| `term_grace_seconds` | `15.0` | Positive TERM-to-KILL grace; systemd TimeoutStopSec adds 5 s |
 | `observe_locks` | `[]` | Optional paths probed with shared nonblocking flock at stop |
 
 | Lease key (`lease`) | Default | Meaning |
@@ -115,7 +115,7 @@ A legacy lock requires a path; its mode defaults to `shared`.
 | --- | --- | --- |
 | `on_admit` | `[]` | argv run once after workload startup |
 | `on_warn` | `[]` | argv run on a pressure or contention warning |
-| `on_stop` | `[]` | argv run before an automatic stop |
+| `on_stop` | `[]` | argv run after TERM, during an automatic stop's grace |
 
 Hooks run outside the state lock with a 20-second timeout and no retries.
 Each argv element substitutes `{run}`, `{pool}`, `{campaign}`, `{purpose}`,
@@ -140,11 +140,15 @@ MemAvailable - sum(max(0, holder.cost_mib - holder.anon_mib)) - request.cost_mib
 PSI full avg60 <= psi_full_avg60_max
 ```
 
+Requests above MemTotal minus the reserve are rejected before queueing.
+Port probes check both 127.0.0.1 and ::1 when IPv6 is available.
 Unknown anonymous memory gets zero resident credit; file cache gets none.
 Missing memory or PSI data fails closed for admission. A zero load limit
 turns that gate off. Port blocks across pools cannot overlap live holders.
 Compatibility locks are held by the in-unit supervisor for the workload's
-life. A dead ticket cannot block FIFO; an inactive unit is reclaimed by the
+life; queued probes release the lock before sleeping, and status reads lock
+owners without acquiring a lock. A dead ticket cannot block FIFO; an inactive
+unit is reclaimed by the
 next active waiter or supervisor. Unit names are persisted before startup;
 unit-name collisions retry with a fresh admission sequence.
 
@@ -156,12 +160,23 @@ never passed over. For example, if A holds one slot and A2 queues before B,
 B takes the free slot ahead of capped A2; A2 is admitted when a slot is free
 and no other campaign waits.
 
-A campaign may use spare slots when no other campaign waits. Its newest
-holders beyond the cap yield when contention appears. An overdue lease
+Only another campaign below its own cap blocks further admissions. When all
+waiting campaigns already hold their caps, a spare slot can still be used.
+A waiter whose campaign already holds its cap never earns a lease or yield
+stop of another campaign's holder; it waits for a slot to free. This stop-side
+rule applies even when no other campaign waits. A queued ticket refreshes
+its heartbeat every poll; a stale head (five seconds plus three polls) earns
+no stop, even while its flock is still held.
+
+A campaign may use spare slots when no eligible other campaign waits. Its
+newest holders beyond the cap yield when contention appears. An overdue lease
 continues when nobody waits. Under contention only the oldest eligible
 holder whose release admits the head waiter earns a stop. A durable ticket
 claim permits one stop per waiter. At grace expiry all conditions are checked
-again, and the warning is cancelled if the waiter leaves or no longer fits.
+again. During grace, cancellation is limited to the waiter leaving or losing
+effective-head position; fit is checked at grace expiry. A temporary memory
+sample during grace cannot re-arm the warning. Status reports `stopping` as
+soon as the stop is committed.
 If releasing an overdue holder cannot admit the waiter, the holder only
 warns once for that waiter. `on_expiry = "warn"` never stops it.
 Idle release uses cgroup `cpu.stat` and applies only while a fitting waiter
@@ -169,10 +184,15 @@ exists. Pools with `evictable = false` never stop automatically.
 
 On pressure the newest evictable holder stops itself. A stop records live
 stats, holder costs and anonymous memory, and optional lock observations;
-admission waits for the recovery interval. State is locked and atomically
+memory-gated admission waits for the recovery interval. Pools without the
+memory gate ignore pressure recovery. State is locked and atomically
 replaced in `${XDG_RUNTIME_DIR:-/run/user/UID}/slotr`. Events append to
 `${XDG_STATE_HOME:-~/.local/state}/slotr/events.jsonl`. Neither persists
-workload argv or environment contents. `status` observes without creating,
+workload argv or environment contents. systemd-run receives only valid
+environment variable names via --setenv=NAME, keeping values off its command
+line. State timing uses CLOCK_BOOTTIME (including suspend); displayed and
+logged timestamps remain UTC RFC 3339. Older wall-time state timestamps are
+accepted and converted on read. `status` observes without creating,
 changing, or deleting files and without signalling any process.
 
 Exit codes: normal workload codes are relayed; signals return 128 + signal;
@@ -187,6 +207,9 @@ Port probes are not reservations: applications must use strict port binding.
 Detached containers and workloads escaping the user unit are unsupported.
 There is no hosted queue, campaign authentication, auto-restart, or Mac run
 backend. A warning hook can delay that supervisor by up to its timeout.
+A failed manager/state/logging tick is reported and retried; it never kills a
+workload or discards a waiting ticket. Stop hooks run after TERM and alongside
+the grace timer, so a slow hook cannot delay TERM or KILL.
 
 Validate locally (Python 3.11+ stdlib drives the fake-systemd integration tests):
 
@@ -203,8 +226,8 @@ Only `SLOTR_TEST=1` enables test seams: `SLOTR_PROC_ROOT`, `SLOTR_CGROUP_ROOT`,
 added to the real wall clock). Production ignores all of them.
 
 Local releases use `sh scripts/release.sh VERSION` on a clean Linux x86_64
-checkout. It refuses dirty trees, existing local `vVERSION` tags, and other
+checkout. VERSION must match Cargo.toml. It refuses dirty trees, existing local `vVERSION` tags, and other
 hosts (exit 2). Assets in `dist/` are
 `slotr-VERSION-x86_64-unknown-linux-musl.tar.gz` and its `.sha256` file.
 `--publish` explicitly creates a GitHub release or uploads to an existing
-one using `gh`. There are no GitHub Actions workflows.
+one using `gh`, targeting the exact local HEAD that was built. There are no GitHub Actions workflows.

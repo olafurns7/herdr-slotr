@@ -23,6 +23,11 @@ if git rev-parse --verify --quiet "refs/tags/v$version" >/dev/null; then
     echo "slotr: tag v$version already exists" >&2
     exit 2
 fi
+package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+if [ "$version" != "$package_version" ]; then
+    echo "slotr: VERSION must match Cargo.toml ($package_version)" >&2
+    exit 2
+fi
 target=x86_64-unknown-linux-musl
 cargo build --release --locked --target "$target"
 mkdir -p dist
@@ -33,6 +38,6 @@ if [ "$publish" = --publish ]; then
     if gh release view "v$version" >/dev/null 2>&1; then
         gh release upload "v$version" "dist/$asset" "dist/$asset.sha256"
     else
-        gh release create "v$version" "dist/$asset" "dist/$asset.sha256" --title "slotr $version" --notes "Linux x86_64 musl build."
+        gh release create "v$version" --target "$(git rev-parse HEAD)" "dist/$asset" "dist/$asset.sha256" --title "slotr $version" --notes "Linux x86_64 musl build."
     fi
 fi

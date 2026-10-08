@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use rustix::{
     fs::{FlockOperation, flock},
-    process::{Pid, Signal, kill_process_group},
+    process::{Pid, Signal, kill_process_group, test_kill_process_group},
 };
 use serde_json::{Value, json};
 use std::{
@@ -53,39 +53,48 @@ pub fn now() -> f64 {
     } else {
         0.0
     };
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0 + offset
+}
+pub fn wall_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
-        + offset
 }
+
 pub fn code(status: std::process::ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
-pub fn capture(command: &mut Command, timeout: Duration) -> Result<Output> {
+pub fn capture(command: &mut Command, timeout: Duration, read_output: bool) -> Result<Output> {
     let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(if read_output {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if read_output {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()?;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let reader = |mut pipe: Box<dyn Read + Send>| {
         thread::spawn(move || {
             let mut bytes = vec![];
             pipe.read_to_end(&mut bytes).map(|_| bytes)
         })
     };
-    let out = reader(Box::new(stdout));
-    let err = reader(Box::new(stderr));
+    let out = stdout.map(|pipe| reader(Box::new(pipe)));
+    let err = stderr.map(|pipe| reader(Box::new(pipe)));
     let start = Instant::now();
     let status = loop {
         let status = child.try_wait()?;
-        if let Some(status) = status
-            && out.is_finished()
-            && err.is_finished()
-        {
+        if let Some(status) = status {
             break status;
         }
         if start.elapsed() >= timeout {
@@ -99,11 +108,19 @@ pub fn capture(command: &mut Command, timeout: Duration) -> Result<Output> {
     Ok(Output {
         status,
         stdout: out
-            .join()
-            .map_err(|_| anyhow::anyhow!("output reader failed"))??,
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("output reader failed")))
+            })
+            .transpose()?
+            .unwrap_or_default(),
         stderr: err
-            .join()
-            .map_err(|_| anyhow::anyhow!("error reader failed"))??,
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("error reader failed")))
+            })
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 pub fn ctl(args: &[&str]) -> Result<Output> {
@@ -113,6 +130,7 @@ pub fn ctl(args: &[&str]) -> Result<Output> {
             .args(args)
             .process_group(0),
         Duration::from_secs(5),
+        true,
     )?;
     if String::from_utf8_lossy(&output.stderr)
         .to_lowercase()
@@ -193,6 +211,14 @@ pub fn reconcile(s: &mut State, obs: &BTreeMap<String, Observation>) {
                 || (!h.started && state::ticket_live(h.request.enqueue_seq))
         })
     });
+    for q in &mut s.queue {
+        if q.stop_claimed_by.as_ref().is_some_and(|run| {
+            !s.holders.iter().any(|h| &h.run == run)
+                && s.last_stop.as_ref().is_none_or(|stop| &stop.run != run)
+        }) {
+            q.stop_claimed_by = None;
+        }
+    }
     // ponytail: live waiter scans are quadratic; use a set if queues become large.
     for h in &mut s.holders {
         h.warned_waiters
@@ -203,7 +229,7 @@ pub fn events_path() -> PathBuf {
     config::xdg("XDG_STATE_HOME", ".local/state").join("slotr/events.jsonl")
 }
 pub fn event(mut data: Value) -> Result<()> {
-    data["at"] = json!(crate::timestamp::format(now())?);
+    data["at"] = json!(crate::timestamp::format(wall_now())?);
     let path = events_path();
     fs::create_dir_all(path.parent().unwrap())?;
     let mut file = OpenOptions::new()
@@ -242,12 +268,19 @@ pub fn legacy(pool: &config::Pool, readonly: bool) -> Result<(bool, Option<File>
     }
 }
 pub fn ports_free(base: u32, probe: u32) -> bool {
-    (base..base + probe)
-        .map(|p| std::net::TcpListener::bind(("127.0.0.1", p as u16)))
-        .collect::<std::io::Result<Vec<_>>>()
-        .is_ok()
+    let mut sockets = vec![];
+    for port in base..base + probe {
+        for addr in ["127.0.0.1", "::1"] {
+            match std::net::TcpListener::bind((addr, port as u16)) {
+                Ok(socket) => sockets.push(socket),
+                Err(e) if addr == "::1" && matches!(e.raw_os_error(), Some(97 | 99)) => {} // IPv6 disabled on this host.
+                Err(_) => return false,
+            }
+        }
+    }
+    true
 }
-pub fn legacy_pid(pool: &config::Pool) -> Option<i32> {
+fn legacy_holder(pool: &config::Pool) -> Option<(i32, bool)> {
     let metadata = fs::metadata(&pool.legacy_lock.as_ref()?.path).ok()?;
     let target = format!(
         "{:02x}:{:02x}:{}",
@@ -261,9 +294,21 @@ pub fn legacy_pid(pool: &config::Pool) -> Option<i32> {
         .find_map(|l| {
             let p: Vec<_> = l.split_whitespace().collect();
             (p.len() > 5 && p[1] == "FLOCK" && p[5] == target)
-                .then(|| p[4].parse().ok())
+                .then(|| p[4].parse().ok().map(|pid| (pid, p[3] == "WRITE")))
                 .flatten()
         })
+}
+pub fn legacy_pid(pool: &config::Pool) -> Option<i32> {
+    legacy_holder(pool).map(|(pid, _)| pid)
+}
+pub fn legacy_free(pool: &config::Pool) -> bool {
+    legacy_holder(pool).is_none_or(|(_, exclusive)| {
+        !exclusive
+            && pool
+                .legacy_lock
+                .as_ref()
+                .is_some_and(|l| l.mode == "shared")
+    })
 }
 pub fn hook(cfg: &config::Config, name: &str, h: &Holder, reason: &str) {
     let argv = match name {
@@ -319,6 +364,7 @@ pub fn hook(cfg: &config::Config, name: &str, h: &Holder, reason: &str) {
     let result = capture(
         Command::new(&args[0]).args(&args[1..]).process_group(0),
         Duration::from_secs(20),
+        false,
     );
     let (exit, error) = match result {
         Ok(o) => (Some(code(o.status)), None),
@@ -337,10 +383,16 @@ pub fn kill_group(child: &Child, signal: Signal) -> Result<()> {
 }
 pub fn terminate(child: &mut Child, seconds: f64) -> Result<()> {
     kill_group(child, Signal::TERM)?;
-    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
-    // Stay alive for the full grace, even if the direct child exits first.
+    finish_termination(child, Instant::now() + Duration::from_secs_f64(seconds))
+}
+pub fn finish_termination(child: &mut Child, deadline: Instant) -> Result<()> {
+    let pid = Pid::from_raw(child.id() as i32).context("invalid workload pid")?;
     while Instant::now() < deadline {
         let _ = child.try_wait()?;
+        if matches!(test_kill_process_group(pid), Err(rustix::io::Errno::SRCH)) {
+            child.wait().context("reap workload")?;
+            return Ok(());
+        }
         thread::sleep(
             Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
         );

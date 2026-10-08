@@ -34,6 +34,14 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
     } else {
         args.cost.unwrap_or(pool.default_cost_mib)
     };
+    if pool.memory_gated
+        && let Some(total) = stats::read().total_mib
+    {
+        ensure!(
+            cost as f64 <= (total - cfg.admission.reserve_mib as f64).max(0.0),
+            "cost exceeds MemTotal minus admission.reserve_mib"
+        );
+    }
     let cap = config::duration(&pool.max_lease)?;
     let requested = args
         .lease
@@ -57,7 +65,7 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
         s.enqueue_seq += 1;
         let seq = s.enqueue_seq;
         let ticket = state::writable(&state::root().join(format!("ticket-{seq}")))?;
-        flock(&ticket, FlockOperation::LockExclusive)?;
+        flock(&ticket, FlockOperation::NonBlockingLockExclusive)?;
         s.queue.push(Request {
             enqueue_seq: seq,
             pool: args.pool.clone(),
@@ -69,73 +77,99 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
             cost_mib: cost,
             lease_seconds: lease,
             since: manager::now(),
+            seen_at: manager::now(),
             stop_claimed_by: None,
         });
         Ok((seq, ticket))
     })?;
     let result = (|| {
         let mut previous = None;
+        let mut previous_error = None;
         while manager::cancelled() == 0 {
-            let obs = manager::observations(&state::read(&state::root())?)?;
-            let sample = stats::read();
-            let now = manager::now();
-            let (legacy_ok, legacy_file) = manager::legacy(pool, false)?;
-            let (holder, reason) = state::transaction(|s| {
-                manager::reconcile(s, &obs);
-                state::clean_tickets(s)?;
-                admission::update_recovery(s, &sample, cfg, now);
-                let q = s
-                    .queue
-                    .iter()
-                    .find(|q| q.enqueue_seq == seq)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("ticket disappeared"))?;
-                let (slot, mut reason) =
-                    admission::decide(s, &q, cfg, &obs, &sample, now, |slot| {
-                        pool.ports
-                            .as_ref()
-                            .is_none_or(|p| manager::ports_free(p.base + slot * p.stride, p.probe))
-                    });
-                if reason.is_none() && !legacy_ok {
-                    reason = Some("legacy_lock");
+            let poll = (|| -> Result<_> {
+                let obs = manager::observations(&state::read(&state::root())?)?;
+                let sample = stats::read();
+                let now = manager::now();
+                let (legacy_ok, legacy_file) = manager::legacy(pool, false)?;
+                let (holder, reason) = state::transaction(|s| {
+                    manager::reconcile(s, &obs);
+                    state::clean_tickets(s)?;
+                    admission::update_recovery(s, &sample, cfg, now);
+                    let q = s
+                        .queue
+                        .iter_mut()
+                        .find(|q| q.enqueue_seq == seq)
+                        .ok_or_else(|| anyhow::anyhow!("ticket disappeared"))?;
+                    q.seen_at = now;
+                    let q = q.clone();
+                    let (slot, mut reason) =
+                        admission::decide(s, &q, cfg, &obs, &sample, now, |slot| {
+                            pool.ports.as_ref().is_none_or(|p| {
+                                manager::ports_free(p.base + slot * p.stride, p.probe)
+                            })
+                        });
+                    if reason.is_none() && !legacy_ok {
+                        reason = Some("legacy_lock");
+                    }
+                    if admission::head(s, &args.pool, cfg).is_none_or(|q| q.enqueue_seq != seq) {
+                        reason = Some(reason.unwrap_or("fifo"));
+                    }
+                    if reason.is_some() {
+                        return Ok((None, reason));
+                    }
+                    s.admit_seq += 1;
+                    let base = pool
+                        .ports
+                        .as_ref()
+                        .map(|p| p.base + slot.unwrap() * p.stride);
+                    let holder = Holder {
+                        request: q,
+                        run: format!("slotr-{}-{}", args.pool, s.admit_seq),
+                        admit_seq: s.admit_seq,
+                        slot: slot.unwrap(),
+                        port_base: base,
+                        port_end: base.zip(pool.ports.as_ref()).map(|(b, p)| b + p.stride - 1),
+                        admitted_at: now,
+                        lease_expires_at: (lease > 0.0).then_some(now + lease),
+                        started: false,
+                        stopping_at: None,
+                        warned_at: None,
+                        warned_for: None,
+                        warned_waiters: vec![],
+                        idle_since: None,
+                        cpu_usage_usec: None,
+                        cpu_sample_at: None,
+                    };
+                    s.holders.push(holder.clone());
+                    s.queue.retain(|q| q.enqueue_seq != seq);
+                    Ok((Some(holder), None))
+                })?;
+                Ok((holder, reason, legacy_file))
+            })();
+            let (holder, reason, legacy_file) = match poll {
+                Ok(value) => {
+                    previous_error = None;
+                    value
                 }
-                if admission::head(s, &args.pool, cfg).is_none_or(|q| q.enqueue_seq != seq) {
-                    reason = Some(reason.unwrap_or("fifo"));
+                Err(error) => {
+                    let message = error.to_string();
+                    if previous_error.as_ref() != Some(&message) {
+                        eprintln!("slotr: waiter tick: {error:#}");
+                        let _ = manager::event(
+                            json!({"event":"waiter_tick_error","ticket":seq,"error":message}),
+                        );
+                        previous_error = Some(message);
+                    }
+                    thread::sleep(Duration::from_millis(cfg.admission.queue_poll_ms));
+                    continue;
                 }
-                if reason.is_some() {
-                    return Ok((None, reason));
-                }
-                s.admit_seq += 1;
-                let base = pool
-                    .ports
-                    .as_ref()
-                    .map(|p| p.base + slot.unwrap() * p.stride);
-                let holder = Holder {
-                    request: q,
-                    run: format!("slotr-{}-{}", args.pool, s.admit_seq),
-                    admit_seq: s.admit_seq,
-                    slot: slot.unwrap(),
-                    port_base: base,
-                    port_end: base.zip(pool.ports.as_ref()).map(|(b, p)| b + p.stride - 1),
-                    admitted_at: now,
-                    lease_expires_at: (lease > 0.0).then_some(now + lease),
-                    started: false,
-                    warned_at: None,
-                    warned_for: None,
-                    warned_waiters: vec![],
-                    idle_since: None,
-                    cpu_usage_usec: None,
-                    cpu_sample_at: None,
-                };
-                s.holders.push(holder.clone());
-                s.queue.retain(|q| q.enqueue_seq != seq);
-                Ok((Some(holder), None))
-            })?;
+            };
             // Keep shared locks through startup; exclusive mode needs a handoff.
-            let _legacy_file = legacy_file
+            let legacy_file = legacy_file
                 .filter(|_| pool.legacy_lock.as_ref().is_none_or(|l| l.mode == "shared"));
 
             if let Some(holder) = holder {
+                let _legacy_file = legacy_file;
                 let (rc, collision) = launch(&holder, &args.cmd, cfg)?;
                 if !collision {
                     return Ok(rc);
@@ -146,19 +180,22 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                     s.queue.sort_by_key(|q| q.enqueue_seq);
                     Ok(())
                 })?;
-            } else if reason != previous {
-                eprintln!(
-                    "slotr: waiting: {}{}",
-                    reason.unwrap_or("fifo"),
-                    if reason == Some("legacy_lock") {
-                        manager::legacy_pid(pool)
-                            .map(|pid| format!(" (holder pid {pid})"))
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                );
-                previous = reason;
+            } else {
+                drop(legacy_file);
+                if reason != previous {
+                    eprintln!(
+                        "slotr: waiting: {}{}",
+                        reason.unwrap_or("fifo"),
+                        if reason == Some("legacy_lock") {
+                            manager::legacy_pid(pool)
+                                .map(|pid| format!(" (holder pid {pid})"))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    );
+                    previous = reason;
+                }
             }
             thread::sleep(Duration::from_millis(cfg.admission.queue_poll_ms));
         }
@@ -167,9 +204,13 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
     drop(ticket);
     let cleanup = state::transaction(|s| {
         s.queue.retain(|q| q.enqueue_seq != seq);
+        s.holders
+            .retain(|h| h.request.enqueue_seq != seq || h.started);
         state::clean_tickets(s)
     });
-    cleanup?;
+    if let Err(error) = cleanup {
+        eprintln!("slotr: cleanup: {error:#}");
+    }
     result
 }
 fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
@@ -190,7 +231,7 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
     command.arg(format!("--working-directory={}", h.request.cwd));
     for prop in [
         "KillMode=control-group".into(),
-        format!("TimeoutStopSec={}", cfg.watchdog.term_grace_seconds),
+        format!("TimeoutStopSec={}", cfg.watchdog.term_grace_seconds + 5.0),
         "Restart=no".into(),
         "MemoryAccounting=yes".into(),
         "OOMScoreAdjust=500".into(),
@@ -198,12 +239,16 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
     ] {
         command.arg(format!("--property={prop}"));
     }
-    for (key, value) in std::env::vars_os() {
-        let mut arg = std::ffi::OsString::from("--setenv=");
-        arg.push(key);
-        arg.push("=");
-        arg.push(value);
-        command.arg(arg);
+    for (key, _) in std::env::vars_os() {
+        if let Some(name) = key.to_str()
+            && !name.is_empty()
+            && name
+                .bytes()
+                .enumerate()
+                .all(|(i, c)| c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+        {
+            command.arg(format!("--setenv={name}"));
+        }
     }
     command
         .arg("--")
@@ -239,28 +284,37 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
         }
         if manager::cancelled() != 0
             && !stopped
-            && state::read(&state::root())?
-                .holders
-                .iter()
-                .any(|other| other.run == h.run && other.started)
+            && state::read(&state::root()).is_ok_and(|s| {
+                s.holders
+                    .iter()
+                    .any(|other| other.run == h.run && other.started)
+            })
         {
-            manager::ctl(&["stop", &h.run])?;
-            stopped = true;
+            match manager::ctl(&["stop", "--no-block", &h.run]) {
+                Ok(output) if output.status.success() => stopped = true,
+                Ok(_) => {}
+                Err(error) => eprintln!("slotr: stop request: {error:#}"),
+            }
         }
         thread::sleep(Duration::from_millis(20));
     };
     let tail = relay.join().unwrap_or_default();
     let error = String::from_utf8_lossy(&tail).to_lowercase();
-    if error.contains("connect to") && error.contains("bus") {
+    let started = state::read(&state::root())
+        .map(|s| {
+            s.holders
+                .iter()
+                .any(|other| other.run == h.run && other.started)
+        })
+        .unwrap_or(true);
+    if !started && error.contains("connect to") && error.contains("bus") {
         bail!(manager::BUS_ERROR);
     }
-    let started = state::read(&state::root())?
-        .holders
-        .iter()
-        .any(|other| other.run == h.run && other.started);
     let collision = !started
         && !status.success()
-        && (error.contains("already exists") || error.contains("unit exists"));
+        && (error.contains("already exists")
+            || error.contains("unit exists")
+            || error.contains("already loaded"));
     Ok((
         if manager::cancelled() != 0 {
             128 + manager::cancelled()
@@ -279,7 +333,7 @@ pub fn stop(run: &str) -> Result<i32> {
         "unknown run: {run}"
     );
     ensure!(
-        manager::ctl(&["stop", run])?.status.success(),
+        manager::ctl(&["stop", "--no-block", run])?.status.success(),
         "could not stop {run}"
     );
     Ok(crate::ExitCode::Success.value())
@@ -292,13 +346,14 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
     let now = manager::now();
     let mut pools = BTreeMap::new();
     for (name, pool) in &cfg.pools {
-        let (legacy_ok, _lock) = manager::legacy(pool, true)?;
+        let legacy_ok = manager::legacy_free(pool);
         let holders: Vec<_> = s
             .holders
             .iter()
             .filter(|h| h.request.pool == *name)
             .map(|h| {
                 let mut data = serde_json::to_value(h).unwrap();
+                crate::timestamp::display(&mut data).expect("valid holder timestamps");
                 data["state"] = json!(admission::holder_state(h, &s, cfg, now));
                 data["anon_mib"] = json!(obs.get(&h.run).and_then(|o| o.anon_mib));
                 data["cpu_usage_usec"] = json!(obs.get(&h.run).and_then(|o| o.cpu_usec));
@@ -325,6 +380,7 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
                     reason = Some("legacy_lock");
                 }
                 let mut data = serde_json::to_value(q).unwrap();
+                crate::timestamp::display(&mut data).expect("valid ticket timestamps");
                 data["position"] = json!(i + 1);
                 data["wait_reason"] = json!(
                     reason.unwrap_or(
@@ -346,7 +402,9 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
         let reserved = admission::outstanding(&s, &obs);
         pools.insert(name,json!({"slots":pool.slots,"holders":holders,"queue":queue,"budget":{"reserve_mib":cfg.admission.reserve_mib,"outstanding_mib":reserved,"projected_free_mib":sample.available_mib.map(|v|v-reserved-pool.default_cost_mib as f64)}}));
     }
-    let data = json!({"schema_version":1,"stats":sample,"pools":pools,"last_stop":s.last_stop,"events_path":manager::events_path()});
+    let mut last_stop = serde_json::to_value(&s.last_stop)?;
+    crate::timestamp::display(&mut last_stop)?;
+    let data = json!({"schema_version":1,"stats":sample,"pools":pools,"last_stop":last_stop,"events_path":manager::events_path()});
     if as_json {
         println!("{}", serde_json::to_string(&data)?);
     } else {
