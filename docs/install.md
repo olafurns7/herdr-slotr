@@ -40,97 +40,56 @@ Rerun the install command to update.
 
 ## Manual install
 
-Run these steps in the same shell. Stop if a command fails.
+These steps do by hand what the script does. Run them in one shell and stop
+if a command fails.
 
-1. Make a temporary download directory.
-
-   ```sh
-   d=$(mktemp -d)
-   ```
-
-2. Choose the release archive.
+1. Download the archive and its checksum into an empty directory.
 
    ```sh
-   a=slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
+   cd "$(mktemp -d)"
+   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.1.2/slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
+   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.1.2/slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz.sha256
    ```
 
-3. Set the release URL.
+2. Verify the download. Go on only when it prints `OK`.
 
    ```sh
-   base=https://github.com/olafurns7/herdr-slotr/releases/download/v0.1.2
+   sha256sum -c slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz.sha256
    ```
 
-4. Download the binary archive.
+3. Look at what the archive holds. It should list only `slotr`, `LICENSE`
+   and `THIRD-PARTY-NOTICES`, each on a line that starts with `-`.
 
    ```sh
-   curl -fsSL "$base/$a" -o "$d/$a"
+   tar -tvzf slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
    ```
 
-5. Download its checksum.
+4. Extract the binary. Only `slotr` is taken out.
 
    ```sh
-   curl -fsSL "$base/$a.sha256" -o "$d/$a.sha256"
+   tar -xzf slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz slotr
    ```
 
-6. Read the checksum; proceed only if it has one line naming exactly `$a`.
+5. Install it for your user.
 
    ```sh
-   cat "$d/$a.sha256"
+   install -D -m 0755 slotr ~/.local/bin/slotr
    ```
 
-7. Verify the archive; proceed only when it prints `OK`.
+6. Check that it runs.
 
    ```sh
-   (cd "$d" && sha256sum -c "$a.sha256")
+   ~/.local/bin/slotr --version
    ```
-
-8. Read the archive listing; stop if tar reports an error.
-
-   ```sh
-   m=$(tar -tvzf "$d/$a")
-   ```
-
-9. Check regular files, allowed names, and duplicates before extraction.
-
-   ```sh
-   printf '%s\n' "$m" | awk '$1 !~ /^-/ || NF != 6 || ($6 != "slotr" && $6 != "LICENSE" && $6 != "THIRD-PARTY-NOTICES") {bad=1} {if (seen[$6]++) bad=1} $6 == "slotr" {binary++} END {exit bad || binary != 1}'
-   ```
-
-10. Make an empty extraction directory.
-
-   ```sh
-   mkdir "$d/bin"
-   ```
-
-11. Extract only the checked binary.
-
-    ```sh
-    tar -xzf "$d/$a" -C "$d/bin" slotr
-    ```
-
-12. Create the install directory.
-
-    ```sh
-    mkdir -p ~/.local/bin
-    ```
-
-13. Install the binary with executable permissions.
-
-    ```sh
-    install -m 0755 "$d/bin/slotr" ~/.local/bin/slotr
-    ```
-
-14. Check the installed version.
-
-    ```sh
-    ~/.local/bin/slotr --version
-    ```
 
 ## Mirrors and tests
 
 `SLOTR_INSTALL_BASE_URL` overrides the release download directory. Mirrors
 must serve the exact archive name, its `.sha256`, and `config.example.toml`
-for `--config`. The version still comes from the script. Local tests use
+for `--config`. The version still comes from the script. The script trusts that
+location completely. The checksum comes from the same place, so it catches
+a damaged download, not a changed one. Leave the variable unset unless you
+mean to use a mirror. Local tests use
 `file://` URLs, which curl supports:
 
 ```sh

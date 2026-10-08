@@ -79,6 +79,13 @@ pack slotr LICENSE THIRD-PARTY-NOTICES extra
 refused 'slotr install: the archive layout is invalid'
 pack slotr LICENSE LICENSE
 refused 'slotr install: the archive layout is invalid'
+tar -cf "$work/dup.tar" -C "$work/members" slotr LICENSE
+tar -rf "$work/dup.tar" -C "$work/members" LICENSE
+gzip -c "$work/dup.tar" >"$release/$asset"
+(cd "$release" && sha256sum "$asset" >"$asset.sha256")
+refused 'slotr install: the archive layout is invalid'
+pack LICENSE THIRD-PARTY-NOTICES
+refused 'slotr install: the archive layout is invalid'
 mv "$work/members/slotr" "$work/stub"
 ln -s LICENSE "$work/members/slotr"
 pack slotr LICENSE THIRD-PARTY-NOTICES
