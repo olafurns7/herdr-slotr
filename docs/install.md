@@ -37,7 +37,7 @@ The same steps by hand:
 d=$(mktemp -d)
 a=slotr-0.1.0-x86_64-unknown-linux-musl.tar.gz
 gh release download v0.1.0 --repo olafurns7/herdr-slotr --pattern "$a" --pattern "$a.sha256" --dir "$d"
-[ "$(sha256sum <"$d/$a" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$d/$a.sha256")" ] && echo "checksum OK"
+h=$(sha256sum <"$d/$a" | cut -d' ' -f1) && [ "${#h}" -eq 64 ] && [ "$h" = "$(cut -d' ' -f1 "$d/$a.sha256")" ] && echo "checksum OK"
 tar -xzf "$d/$a" -C "$d" slotr
 mkdir -p ~/.local/bin
 install -m 0755 "$d/slotr" ~/.local/bin/slotr
