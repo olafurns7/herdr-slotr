@@ -29,10 +29,24 @@ if [ "$version" != "$package_version" ]; then
     exit 2
 fi
 target=x86_64-unknown-linux-musl
-cargo build --release --locked --target "$target"
+sh scripts/notices.sh --check
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup --remap-path-prefix=$(pwd -P)=/slotr" \
+    cargo build --release --locked --target "$target"
 mkdir -p dist
 asset="slotr-$version-$target.tar.gz"
-tar -czf "dist/$asset" -C "target/$target/release" slotr
+tar --owner=0 --group=0 --numeric-owner --sort=name -czf "dist/$asset" \
+    LICENSE THIRD-PARTY-NOTICES -C "target/$target/release" slotr
+strings "target/$target/release/slotr" > dist/binary-strings.txt
+tar -tvzf "dist/$asset" > dist/archive-list.txt
+for listing in dist/binary-strings.txt dist/archive-list.txt; do
+    if grep -Eq '/home/|/Users/|/mnt/' "$listing" || grep -Fq "$(id -un)" "$listing" ||
+        grep -Fq -e "$cargo_home" -e "$rustup_home" -e "$(pwd -P)" "$listing"; then
+        echo "slotr: release contains a builder path or login name" >&2
+        exit 1
+    fi
+done
 (cd dist && sha256sum "$asset" > "$asset.sha256")
 if [ "$publish" = --publish ]; then
     if gh release view "v$version" >/dev/null 2>&1; then

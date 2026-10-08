@@ -6,14 +6,13 @@ slotr prints its own errors on stderr as `slotr: MESSAGE` and exits 2.
 
 ## Install
 
-**`gh` is not signed in.** `gh release download` needs `gh` signed in with
-access to olafurns7/herdr-slotr. The agent setup block prints
+**`gh` is not signed in.** `gh release download` needs `gh` signed in. The
+agent setup block prints
 `slotr setup: gh is missing or not signed in`. Sign in with `gh auth login`
 or export `GH_TOKEN`, then run the block again.
 
 **The download fails.** The agent setup block prints
-`slotr setup: the release download failed`. Check that your `gh` account can
-see olafurns7/herdr-slotr and that release v0.1.0 exists.
+`slotr setup: the release download failed`. Check that release v0.1.1 exists.
 
 **Checksum mismatch.** The quick install block stops before installing and
 prints no version line. The manual steps do not print `checksum OK`. The
