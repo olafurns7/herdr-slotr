@@ -2,47 +2,27 @@
 
 This file explains how slotr is installed on a Herdr fleet host and how agents use it there.
 
-## What the quick agent setup block does
+## Quick agent setup
 
-The README's quick agent setup block installs the same pinned release with
-the same checks as herdr-setup's installer, then adds a config file:
+```sh
+curl -fsSL https://github.com/olafurns7/herdr-slotr/releases/latest/download/install.sh | sh -s -- --config
+```
 
-1. Stops unless the host is Linux x86_64.
-2. Stops unless `gh` is installed and `gh auth status` succeeds.
-3. Downloads the v0.1.1 musl archive and its `.sha256` file into a
-   `mktemp -d` directory.
-4. Computes the archive's SHA-256 itself. The `.sha256` file must be exactly
-   one line, `HASH  ASSETNAME` (or `HASH *ASSETNAME`), naming this asset.
-   It does not use `sha256sum -c`, which would check whatever paths the file
-   names. The quick install block also computes the hash itself, but compares
-   only the hash and does not check the line count or the name.
-5. Checks that every archive member is a regular file, exactly one is named
-   `slotr`, and the others are only `LICENSE` or `THIRD-PARTY-NOTICES`.
-   Only `slotr` is extracted into an empty directory. A symlink is refused.
-6. Writes the binary to a temporary file in `~/.local/bin`, sets mode 0755,
-   and renames it to `~/.local/bin/slotr`. A running slotr keeps its old
-   binary and no reader sees a partial file.
-7. Runs `~/.local/bin/slotr --version`.
-8. If `~/.config/slotr/config.toml` does not exist, downloads
-   `config.example.toml` from tag v0.1.1 and puts it there. An existing
-   config is never overwritten. The example equals the built-in defaults.
-9. Runs `slotr config check`, which prints `slotr: config OK`.
+The script downloads its pinned Linux x86_64 release, verifies the checksum
+and archive layout, and installs it atomically to `~/.local/bin/slotr`.
+It creates `~/.config/slotr/config.toml` from the release's example only
+when no config exists, keeps an existing config, then checks that file.
+It prints the installed version and tells you when to add `~/.local/bin`
+to `PATH`. Running it again replaces the binary.
 
-A check that uses `fail` prints `slotr setup:` and the reason, and the block
-exits 1. Any other command that fails (such as `tar`, `mkdir`, `mktemp`, the
-config download, or slotr itself) stops the block with its own message and
-exit status.
-The block installs even when v0.1.1 is already present.
-
-The block reads and writes `~/.config/slotr/config.toml`. If
-`XDG_CONFIG_HOME` or `SLOTR_CONFIG` is set, slotr reads its config from
-another path; see [configuration.md](configuration.md).
+See [install.md](install.md) for requirements, manual steps, and mirrors.
+If `XDG_CONFIG_HOME` or `SLOTR_CONFIG` is set, slotr normally reads another
+config path; this installer still creates and checks the file above.
+See [configuration.md](configuration.md).
 
 ## herdr-setup
 
-herdr-setup's installer installs the same pinned release (v0.1.1) with the
-same checks as the quick agent setup block. It needs `gh` signed in; sign in with `gh auth login` or export
-`GH_TOKEN`.
+herdr-setup installs the pinned release with its own checks.
 
 ## Using slotr in a fleet
 

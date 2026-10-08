@@ -6,19 +6,43 @@ slotr prints its own errors on stderr as `slotr: MESSAGE` and exits 2.
 
 ## Install
 
-**`gh` is not signed in.** `gh release download` needs `gh` signed in. The
-agent setup block prints
-`slotr setup: gh is missing or not signed in`. Sign in with `gh auth login`
-or export `GH_TOKEN`, then run the block again.
+Install failures print one line on stderr and exit 1. Unknown arguments
+print `usage: sh install.sh [--config]` and exit 2.
 
-**The download fails.** The agent setup block prints
-`slotr setup: the release download failed`. Check that release v0.1.1 exists.
+**Unsupported host.** `slotr install: Linux x86_64 only` means the release
+cannot run on this platform.
 
-**Checksum mismatch.** The quick install block stops before installing and
-prints no version line. The manual steps do not print `checksum OK`. The
-agent setup block prints
-`slotr setup: the checksum did not verify`. Do not install that file;
-download it again.
+**Missing tools.** `slotr install: missing curl`, `slotr install: missing tar`,
+or `slotr install: missing sha256sum` names the tool to install.
+
+**Download failure.** `slotr install: the release download failed` means an
+archive or checksum could not be downloaded. Check the release URL and network.
+`slotr install: the config download failed` means the example config asset
+could not be downloaded.
+
+**Checksum mismatch.** `slotr install: the checksum did not verify` means
+the hash, line count, or asset name did not match. Download the assets again.
+
+**Unsafe archive.** `slotr install: the archive layout is invalid` means
+members are missing, duplicated, unexpected, or not regular files.
+`slotr install: the archive holds no slotr binary` means extraction failed
+or the extracted file was missing or a symlink. Do not install that archive.
+
+**Write failure.** `slotr install: cannot write ~/.local/bin/slotr`,
+`slotr install: cannot create config directory`, or
+`slotr install: cannot write config` means the destination is not writable.
+Check permissions and free space. `slotr install: cannot create temporary directory`
+means the temporary download directory could not be made.
+`slotr install: HOME is not set` means the shell has no home directory set.
+
+**Binary or config check failed.** `slotr install: slotr --version failed`
+means the installed binary could not report its version.
+`slotr install: slotr config check failed` means the config check failed;
+run `slotr config check ~/.config/slotr/config.toml` to see the reason.
+The binary has already been installed when these checks run.
+
+**Interrupted.** `slotr install: interrupted` means a signal stopped the
+installer. Run it again when ready.
 
 **`slotr: command not found`.** `~/.local/bin` is not on your `PATH`. Run
 `~/.local/bin/slotr`, or add `~/.local/bin` to `PATH`.
