@@ -13,7 +13,7 @@ base = 31000
 stride = 32
 probe = 7
 [pools.runtime.legacy_lock]
-path = "/tmp/trip-runtime.lock"
+path = "/tmp/runtime.lock"
 mode = "shared"
 [admission]
 reserve_mib = 5120
@@ -22,7 +22,7 @@ load1_per_core_max = 0.0
 recovery_healthy_seconds = 30.0
 queue_poll_ms = 1000
 [watchdog]
-observe_locks = ["/tmp/trip-heavy.lock"]
+observe_locks = ["/tmp/heavy.lock"]
 interval_ms = 2000
 on_pressure = "stop"
 stop_available_mib = 4000
