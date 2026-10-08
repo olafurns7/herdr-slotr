@@ -1,0 +1,48 @@
+# Built-in defaults. Dynamic pools replace "default" when configured.
+[pools.default]
+slots = 1
+memory_gated = true
+evictable = true
+default_cost_mib = 7680
+max_lease = "4h" # "0" disables the lease cap
+campaign_cap = 1 # 0 disables the cap
+# Optional tables (absent by default):
+# [pools.default.ports]
+# base = 31000
+# stride = 32
+# probe = 7 # first N ports in each block; probes are not reservations
+# [pools.default.legacy_lock]
+# path = "/tmp/example-runtime.lock"
+# mode = "shared" # shared or exclusive
+# [pools.default.kinds.dev-stack]
+# cost_mib = 7680
+
+[admission]
+reserve_mib = 5120
+psi_full_avg60_max = 5.0
+load1_per_core_max = 0.0 # 0 disables the load gate
+recovery_healthy_seconds = 30.0
+queue_poll_ms = 1000
+
+[watchdog]
+observe_locks = [] # report whether these locks are held at a stop (shared probe)
+interval_ms = 2000
+on_pressure = "stop" # stop, warn, off
+stop_available_mib = 4000
+stop_available_samples = 2
+emergency_available_mib = 2000
+stop_psi_full_avg10_min = 20.0
+stop_psi_samples = 5
+term_grace_seconds = 15.0
+
+[lease]
+on_expiry = "stop" # stop, warn, off
+grace_seconds = 300.0
+waiter_min_wait_seconds = 300.0
+idle_release_minutes = 0.0 # 0 disables idle release
+idle_cpu_ms_per_min = 100.0
+
+[hooks]
+on_admit = [] # argv arrays, never interpreted by a shell
+on_warn = []
+on_stop = []
