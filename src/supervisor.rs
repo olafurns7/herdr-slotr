@@ -68,9 +68,15 @@ fn lease_action(
                 })
             };
             candidates()
-                .filter(|holder| admission::fits_without(s, holder, q, cfg, obs, sample, now))
-                .min_by_key(|holder| holder.admit_seq)
-                .or_else(|| candidates().min_by_key(|holder| holder.admit_seq))
+                .find(|holder| q.stop_claimed_by.as_deref() == Some(holder.run.as_str()))
+                .or_else(|| {
+                    candidates()
+                        .filter(|holder| {
+                            admission::fits_without(s, holder, q, cfg, obs, sample, now)
+                        })
+                        .min_by_key(|holder| holder.admit_seq)
+                        .or_else(|| candidates().min_by_key(|holder| holder.admit_seq))
+                })
         })
         .map(|holder| holder.run.as_str());
     let may_stop = fits
@@ -128,10 +134,13 @@ fn lease_action(
                 .stop_claimed_by = Some(run.into());
             s.holders[index].warned_at = Some(now);
             s.holders[index].warned_for = Some(q.enqueue_seq);
-        }
-        if !h.warned_waiters.contains(&q.enqueue_seq) {
-            s.holders[index].warned_waiters.push(q.enqueue_seq);
             action.warn = Some((s.holders[index].clone(), reason.into()));
+        } else if !h.warned_waiters.contains(&q.enqueue_seq) {
+            action.warn = Some((s.holders[index].clone(), reason.into()));
+        }
+        // History suppresses only warn-only repeats, never a new stop claim.
+        if action.warn.is_some() && !h.warned_waiters.contains(&q.enqueue_seq) {
+            s.holders[index].warned_waiters.push(q.enqueue_seq);
         }
     }
     action
@@ -180,6 +189,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
         let mut memory_count: u32 = 0;
         let mut psi_count: u32 = 0;
         let mut pressure_warned = false;
+        let mut previous_error = None;
         let mut tick = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
@@ -225,16 +235,28 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                 } else {
                     None
                 };
-                let obs = manager::observations(&state::read(&state::root())?)?;
+                let (obs, query_error) = match manager::observations(&state::read(&state::root())?)
+                {
+                    Ok(obs) => (obs, None),
+                    Err(error) => (BTreeMap::new(), Some(error)),
+                };
                 let action = state::transaction(|s| {
                     manager::reconcile(s, &obs);
+                    // The supervisor owns this live workload even after state.json is reset.
+                    if !s.holders.iter().any(|holder| holder.run == run) {
+                        s.enqueue_seq = s.enqueue_seq.max(h.request.enqueue_seq);
+                        s.admit_seq = s.admit_seq.max(h.admit_seq);
+                        s.holders.push(h.clone());
+                    }
                     admission::update_recovery(s, &sample, cfg, now);
-                    let fitting_waiter =
-                        admission::head(s, &h.request.pool, cfg).is_some_and(|q| {
+                    let fitting_waiter = query_error.is_none()
+                        && admission::head(s, &h.request.pool, cfg).is_some_and(|q| {
                             q.campaign != h.request.campaign
                                 && admission::fits_without(s, &h, q, cfg, &obs, &sample, now)
                         });
-                    if let Some(holder) = s.holders.iter_mut().find(|h| h.run == run) {
+                    if query_error.is_none()
+                        && let Some(holder) = s.holders.iter_mut().find(|h| h.run == run)
+                    {
                         if let Some(cpu) = obs.get(run).and_then(|o| o.cpu_usec) {
                             if let Some((last, at)) =
                                 holder.cpu_usage_usec.zip(holder.cpu_sample_at)
@@ -283,7 +305,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                             action.warn = Some((h.clone(), reason.into()));
                         }
                     }
-                    if action.stop.is_none() && action.warn.is_none() {
+                    if query_error.is_none() && action.stop.is_none() && action.warn.is_none() {
                         action = lease_action(s, run, cfg, &obs, &sample, now);
                     }
                     if let Some((holder, reason, _)) = &action.stop {
@@ -301,6 +323,11 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                     }
                     Ok(action)
                 })?;
+                if let Some(error) = query_error {
+                    report_tick_error(run, &error, &mut previous_error);
+                } else {
+                    previous_error = None;
+                }
                 if pressure.is_none() {
                     pressure_warned = false;
                 }
@@ -335,18 +362,22 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
             match tick_result {
                 Ok(Some(code)) => return Ok(code),
                 Ok(None) => {}
-                Err(error) => {
-                    eprintln!("slotr: supervisor tick: {error:#}");
-                    let _ = manager::event(
-                        json!({"event":"supervisor_tick_error","run":run,"error":error.to_string()}),
-                    );
-                }
+                Err(error) => report_tick_error(run, &error, &mut previous_error),
             }
         }
     })();
     // Retain the record until systemd confirms the unit has gone. A unit still
     // owns descendants after its supervisor exits (KillMode=control-group).
     result
+}
+
+fn report_tick_error(run: &str, error: &anyhow::Error, previous: &mut Option<String>) {
+    let message = error.to_string();
+    if previous.as_ref() != Some(&message) {
+        eprintln!("slotr: supervisor tick: {error:#}");
+        let _ = manager::event(json!({"event":"supervisor_tick_error","run":run,"error":message}));
+        *previous = Some(message);
+    }
 }
 
 #[test]

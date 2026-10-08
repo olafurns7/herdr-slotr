@@ -831,7 +831,7 @@ class AdmissionTest(unittest.TestCase):
     def test_probe_p08_frozen_head_waiter_earns_no_stop(self):
         self.configure_clock()
         self.set_stats(40000)
-        old, p1 = self.start('old', lease='1s')
+        old, p1 = self.start('old', lease='60s')
         self.wait(p1.exists)
         newer, p2 = self.start('newer')
         self.wait(p2.exists)
@@ -839,7 +839,7 @@ class AdmissionTest(unittest.TestCase):
         self.wait(lambda: bool(self.status()['queue']))
         os.kill(waiter.pid, signal.SIGSTOP)           # Ctrl-Z in the waiter's pane
         try:
-            self.advance(10)
+            self.advance(70)
             self.pause(3.0)
             self.assertIsNone(old.poll(), 'holder stopped (rc=%s) for a frozen waiter; waiter admitted=%s' % (old.returncode, out.exists()))
         finally:
@@ -1102,7 +1102,8 @@ class AdmissionTest(unittest.TestCase):
         with (root / "ticket-1").open("w") as ticket:
             fcntl.flock(ticket, fcntl.LOCK_EX)
             result = self.invoke("run", "--kind", "dev-stack", "--", "true")
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((root / "state.json").read_text())["enqueue_seq"], 2)
         with (root / "state.lock").open("r") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -1136,6 +1137,264 @@ class AdmissionTest(unittest.TestCase):
         self.assertIn("VERSION must match Cargo.toml", result.stderr)
 
 
+
+    def test_probe_r01_a_stop_is_preceded_by_its_own_warning(self):
+        self.configure_clock()
+        self.cfg['on_warn'] = ['taskr', 'note', '{task}', 'WARN', '{run}', '{reason}']
+        self.cfg['grace'] = 1.0
+        self.write_config()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        self.set_stats(10000)                         # the waiter would not fit even without `old`
+        _, waiter = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.wait(lambda: bool(self.events('warn')))
+        self.pause(0.5)
+        self.set_stats(40000)                         # now releasing `old` admits the waiter
+        self.wait(lambda: old.poll() is not None, timeout=8)
+        reasons = [e['reason'] for e in self.events('warn')]
+        hooks = [a[-1] for a in self.notes() if 'WARN' in a]
+        self.assertEqual(old.returncode, 75)
+        self.assertIn('lease_expired', reasons, 'stopped after only these warnings: events %s, hook runs %s' % (reasons, hooks))
+
+    def test_probe_r12_a_stop_after_a_cancelled_warning_is_warned_again(self):
+        self.configure_clock()
+        self.cfg['grace'] = 20
+        self.write_config()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.wait(lambda: bool(self.events('warn')))
+        self.set_stats(10000)                         # at grace end the stop would not admit the waiter
+        self.advance(25)
+        self.wait(lambda: bool(self.events('warn_cancelled')))
+        self.set_stats(40000)                         # the holder claims the same ticket again
+        self.wait(lambda: any(h.get('state') == 'warned' for h in self.status()['slots']))
+        self.advance(25)
+        self.wait(lambda: old.poll() is not None)
+        log = [json.loads(l) for l in (self.root / 'state/slotr/events.jsonl').read_text().splitlines()]
+        order = [e['event'] for e in log if e['event'] in ('warn', 'warn_cancelled', 'stop')]
+        self.assertEqual(old.returncode, 75)
+        self.assertEqual(order, ['warn', 'warn_cancelled', 'warn', 'stop'], 'event order %s' % order)
+
+    def test_probe_r02_waiter_whose_ticket_left_state_does_not_wait_for_ever(self):
+        self.set_stats(10000)
+        waiter, _ = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        (self.runtime / 'slotr/state.json').unlink()  # the operator's only repair for "corrupt state"
+        self.pause(1.5)
+        queued = len(self.status()['queue'])
+        self.assertTrue(waiter.poll() is not None or queued == 1,
+                        'waiter alive, not in the queue; log: %s' % (self.root / 'waiter.log').read_text().strip().splitlines()[-2:])
+
+    def test_probe_r03_new_request_can_enqueue_after_state_reset(self):
+        self.set_stats(10000)
+        self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        (self.runtime / 'slotr/state.json').unlink()
+        self.pause(0.5)
+        self.set_stats(40000)
+        second, out = self.start('second')
+        try:
+            self.wait(out.exists, timeout=3)
+        except AssertionError:
+            self.fail('second request rc=%s log=%s' % (second.poll(), (self.root / 'second.log').read_text().strip().splitlines()[-1:]))
+
+    def test_probe_r04_running_holder_stays_accounted_after_state_reset(self):
+        holder, p1 = self.start('holder')
+        h = self.admitted('holder', p1)
+        (self.runtime / 'slotr/state.json').unlink()
+        self.pause(1.0)
+        self.assertIsNone(holder.poll())
+        self.assertIn(h['run'], [s.get('run') for s in self.status()['slots']], 'the workload runs but no holder record exists')
+
+    def test_probe_r05_persistent_tick_error_is_reported_once(self):
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        (self.runtime / 'ctl-fail').touch()
+        self.pause(2.0)
+        (self.runtime / 'ctl-fail').unlink()
+        events = len(self.events('supervisor_tick_error'))
+        lines = (self.root / 'holder.log').read_text().count('supervisor tick')
+        self.assertIsNone(holder.poll())
+        self.assertLessEqual(max(events, lines), 2, '%d events and %d stderr lines in 2 s' % (events, lines))
+
+    def test_probe_r06_emergency_stop_still_happens_while_the_manager_fails(self):
+        self.set_stats(30000)
+        holder, p1 = self.start('holder')
+        self.admitted('holder', p1)
+        (self.runtime / 'ctl-fail').touch()
+        self.set_stats(1000)                          # below emergency_available_mib
+        self.pause(2.0)
+        rc = holder.poll()
+        (self.runtime / 'ctl-fail').unlink()
+        self.assertEqual(rc, 75, 'no stop in 2 s (28 ticks) at 1000 MiB available; stop events %d' % len(self.events('stop')))
+
+    def test_probe_r07_a_failed_workload_is_not_run_twice(self):
+        self.set_stats(60000)
+        _, p0 = self.start('other')                   # a second holder: its supervisor reconciles state
+        self.admitted('other', p0)
+        marker = self.root / 'ran'
+        code = ("import subprocess, sys; open(%r, 'a').write('ran\\n'); "
+                "print('error: object already exists', file=sys.stderr, flush=True); "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.2)']); sys.exit(1)") % str(marker)
+        child = subprocess.Popen([str(TOOL), 'run', '--pool', 'runtime', '--kind', 'dev-stack', '--campaign', 'x', '--purpose', 'p',
+                                  '--', sys.executable, '-c', code], env=self.env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.children.append(child)
+        try:
+            child.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            pass
+        runs = marker.read_text().count('ran')
+        self.assertEqual((runs, child.poll()), (1, 1), 'the command ran %d times; frontend rc=%s' % (runs, child.poll()))
+
+    def test_probe_r08_status_survives_a_huge_lease(self):
+        self.cfg['max_lease'] = '0'
+        self.write_config()
+        _, p1 = self.start('big', lease='1e15')
+        self.wait(p1.exists)
+        result = self.invoke('status', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr.strip()[:160])
+
+    def test_probe_r09_waiter_frozen_during_grace_cancels_at_grace_end(self):
+        self.configure_clock()
+        self.cfg['grace'] = 20
+        self.write_config()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        waiter, out = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.wait(lambda: any(h.get('state') == 'warned' for h in self.status()['slots']))
+        os.kill(waiter.pid, signal.SIGSTOP)
+        try:
+            self.advance(30)
+            self.pause(2.0)
+            self.assertIsNone(old.poll(), 'stopped rc=%s for a waiter frozen during the grace' % old.returncode)
+            self.assertEqual(len(self.events('warn_cancelled')), 1)
+            self.assertEqual(self.events('stop'), [])
+        finally:
+            os.kill(waiter.pid, signal.SIGCONT)
+
+    def test_probe_r10_stop_of_a_term_ignoring_workload(self):
+        self.cfg['term_grace_seconds'] = 2
+        self.write_config()
+        holder, p1 = self.start('holder', '--ignore-term')
+        h = self.admitted('holder', p1)
+        began = time.monotonic()
+        result = subprocess.run([str(TOOL), 'stop', h['run']], env=self.env, capture_output=True, text=True, timeout=20)
+        took = time.monotonic() - began
+        holder.wait(timeout=10)
+        total = time.monotonic() - began
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertLess(took, 1.0)
+        self.assertEqual(holder.returncode, 143)
+        self.assertTrue(1.5 < total < 4.5, 'unit ended after %.1f s (grace 2)' % total)
+
+    def test_probe_r11_warned_holder_stops_after_grace_and_waiter_is_admitted(self):
+        self.configure_clock()
+        self.cfg['grace'] = 20
+        self.cfg['on_warn'] = ['taskr', 'note', '{task}', 'WARN', '{run}', '{reason}']
+        self.write_config()
+        self.set_stats(40000)
+        old, p1 = self.start('old', lease='1s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer')
+        self.wait(p2.exists)
+        _, out = self.start('waiter')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.advance(10)
+        self.wait(lambda: bool(self.events('warn')))
+        self.pause(0.6)
+        self.assertIsNone(old.poll(), 'stopped before the grace ended')
+        self.advance(25)
+        self.wait(lambda: old.poll() is not None)
+        self.wait(out.exists)
+        self.assertEqual(old.returncode, 75)
+        self.assertEqual([e['reason'] for e in self.events('warn')], ['lease_expired'])
+        self.assertEqual(len(self.events('stop')), 1)
+        self.assertIsNone(newer.poll())
+
+    def test_probe_r13_one_pressure_stop_while_the_newest_holder_is_stopping(self):
+        self.cfg['term_grace_seconds'] = 1.5
+        self.cfg['recovery_healthy_seconds'] = 5.0
+        self.write_config()
+        self.set_stats(40000)
+        older, p1 = self.start('older')
+        h1 = self.admitted('older', p1)
+        newest, p2 = self.start('newest', '--ignore-term')
+        h2 = self.admitted('newest', p2)
+        self.set_stats(1000)                          # emergency
+        self.wait(lambda: bool(self.events('stop')))
+        self.pause(0.7)
+        states = {s['run']: s['state'] for s in self.status()['slots']}
+        self.assertEqual(states.get(h2['run']), 'stopping')
+        self.assertIn(states.get(h1['run']), ('running', 'overdue'))
+        self.wait(lambda: newest.poll() is not None)
+        self.pause(0.5)
+        self.assertEqual(newest.returncode, 75)
+        self.assertIsNone(older.poll())
+        self.assertEqual([e['run'] for e in self.events('stop')], [h2['run']])
+
+    def test_probe_r14_status_times_are_wall_clock_and_lease_length_holds(self):
+        import datetime
+        _, p1 = self.start('holder', lease='90s')
+        h = self.admitted('holder', p1)
+        parse = lambda v: datetime.datetime.fromisoformat(v.replace('Z', '+00:00')).timestamp()
+        self.assertLess(abs(parse(h['admitted_at']) - time.time()), 10)
+        self.assertAlmostEqual(parse(h['lease_expires_at']) - parse(h['admitted_at']), 90, delta=0.01)
+        raw = json.loads((self.runtime / 'slotr/state.json').read_text())['holders'][0]
+        self.assertLess(abs(raw['admitted_at'] - time.clock_gettime(time.CLOCK_BOOTTIME)), 10)
+        self.assertLess(abs(parse(self.events('admit')[0]['at']) - time.time()), 10)
+
+    def test_probe_r15_non_utf8_value_is_passed_by_name_only(self):
+        env = {os.fsencode(k): os.fsencode(v) for k, v in self.env.items()}
+        env[b'LEGACY_LATIN1'] = b'caf\xe9'
+        out = self.root / 'latin'
+        child = subprocess.Popen([str(TOOL), 'run', '--pool', 'runtime', '--kind', 'dev-stack', '--campaign', 'x', '--purpose', 'p', '--',
+                                  sys.executable, '-c', WORKLOAD, str(out)], env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.children.append(child); self.workloads.append(out)
+        self.wait(out.exists)
+        flags = json.loads((self.runtime / 'launches').read_text().splitlines()[0])
+        self.assertIn('--setenv=LEGACY_LATIN1', flags)   # documents the behaviour: real systemd-run must cope with the value
+        self.assertFalse(any('caf' in f for f in flags))
+
+
+    def test_claimant_keeps_waiter_when_an_older_holder_becomes_eligible(self):
+        self.configure_clock()
+        self.cfg['grace'] = 100
+        self.write_config()
+        self.set_stats(40000)
+        older, p1 = self.start('older', campaign='A', lease='60s')
+        self.wait(p1.exists)
+        newer, p2 = self.start('newer', campaign='A')
+        self.wait(p2.exists)
+        _, waiter = self.start('waiter', campaign='B')
+        self.wait(lambda: bool(self.events('warn')))
+        claimed_run = self.events('warn')[0]['run']
+        self.assertEqual(self.events('warn')[0]['reason'], 'campaign_yield')
+        self.advance(110)
+        self.wait(lambda: newer.poll() is not None)
+        self.wait(waiter.exists)
+        self.assertEqual(newer.returncode, 75)
+        self.assertIsNone(older.poll())
+        self.assertEqual([e['run'] for e in self.events('warn')], [claimed_run])
+        self.assertEqual([e['run'] for e in self.events('stop')], [claimed_run])
+        self.assertEqual(self.events('warn_cancelled'), [])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=True)

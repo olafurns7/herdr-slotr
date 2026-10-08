@@ -62,10 +62,16 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
     );
     manager::signals();
     let (seq, ticket) = state::transaction(|s| {
-        s.enqueue_seq += 1;
-        let seq = s.enqueue_seq;
-        let ticket = state::writable(&state::root().join(format!("ticket-{seq}")))?;
-        flock(&ticket, FlockOperation::NonBlockingLockExclusive)?;
+        let (seq, ticket) = loop {
+            s.enqueue_seq += 1;
+            let seq = s.enqueue_seq;
+            let ticket = state::writable(&state::root().join(format!("ticket-{seq}")))?;
+            match flock(&ticket, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break (seq, ticket),
+                Err(rustix::io::Errno::WOULDBLOCK) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         s.queue.push(Request {
             enqueue_seq: seq,
             pool: args.pool.clone(),
@@ -153,6 +159,9 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                 }
                 Err(error) => {
                     let message = error.to_string();
+                    if message == "ticket disappeared" {
+                        return Err(error);
+                    }
                     if previous_error.as_ref() != Some(&message) {
                         eprintln!("slotr: waiter tick: {error:#}");
                         let _ = manager::event(
@@ -287,7 +296,8 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
             && state::read(&state::root()).is_ok_and(|s| {
                 s.holders
                     .iter()
-                    .any(|other| other.run == h.run && other.started)
+                    .find(|other| other.run == h.run)
+                    .is_none_or(|other| other.started)
             })
         {
             match manager::ctl(&["stop", "--no-block", &h.run]) {
@@ -304,7 +314,8 @@ fn launch(h: &Holder, cmd: &[String], cfg: &Config) -> Result<(i32, bool)> {
         .map(|s| {
             s.holders
                 .iter()
-                .any(|other| other.run == h.run && other.started)
+                .find(|other| other.run == h.run)
+                .is_none_or(|other| other.started)
         })
         .unwrap_or(true);
     if !started && error.contains("connect to") && error.contains("bus") {
@@ -353,7 +364,7 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
             .filter(|h| h.request.pool == *name)
             .map(|h| {
                 let mut data = serde_json::to_value(h).unwrap();
-                crate::timestamp::display(&mut data).expect("valid holder timestamps");
+                let _ = crate::timestamp::display(&mut data);
                 data["state"] = json!(admission::holder_state(h, &s, cfg, now));
                 data["anon_mib"] = json!(obs.get(&h.run).and_then(|o| o.anon_mib));
                 data["cpu_usage_usec"] = json!(obs.get(&h.run).and_then(|o| o.cpu_usec));
@@ -380,7 +391,7 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
                     reason = Some("legacy_lock");
                 }
                 let mut data = serde_json::to_value(q).unwrap();
-                crate::timestamp::display(&mut data).expect("valid ticket timestamps");
+                let _ = crate::timestamp::display(&mut data);
                 data["position"] = json!(i + 1);
                 data["wait_reason"] = json!(
                     reason.unwrap_or(

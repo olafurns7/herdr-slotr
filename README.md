@@ -13,7 +13,8 @@ install -m755 target/x86_64-unknown-linux-musl/release/slotr ~/.local/bin/slotr
 ```
 
 `status` and `config` are portable. `run`, `_supervise`, and `stop` require
-Linux and a reachable systemd user bus. Start workloads from a terminal in
+Linux, systemd 255.4 or newer (the verified minimum for name-only `--setenv`),
+and a reachable systemd user bus. Start workloads from a terminal in
 your user session. A sandbox without that bus gets a clear error and exit 2.
 
 ```sh
@@ -172,7 +173,8 @@ A campaign may use spare slots when no eligible other campaign waits. Its
 newest holders beyond the cap yield when contention appears. An overdue lease
 continues when nobody waits. Under contention only the oldest eligible
 holder whose release admits the head waiter earns a stop. A durable ticket
-claim permits one stop per waiter. At grace expiry all conditions are checked
+claim permits one stop per waiter. Its holder stays the candidate through grace
+while eligible, even if an older holder becomes eligible. At grace expiry all conditions are checked
 again. During grace, cancellation is limited to the waiter leaving or losing
 effective-head position; fit is checked at grace expiry. A temporary memory
 sample during grace cannot re-arm the warning. Status reports `stopping` as
