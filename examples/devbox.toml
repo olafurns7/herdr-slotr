@@ -38,8 +38,9 @@ waiter_min_wait_seconds = 300.0
 idle_release_minutes = 0.0
 idle_cpu_ms_per_min = 100.0
 [hooks]
-on_admit = ["taskr", "note", "--as", "{task}", "slotr: admitted {run} ({pool} slot {slot}, port {port_base}): {purpose}; events {events}"]
-# Alternative: on_admit = ["herdr", "agent", "prompt", "{pane}", "--text", "slotr: admitted {run}; {purpose}"]
-on_warn = ["taskr", "note", "--as", "{task}", "slotr: warning {run}: {reason}; campaign {campaign}; events {events}"]
-on_stop = ["taskr", "note", "--as", "{task}", "slotr: stopped {run}: {reason}; re-queue with slotr run --pool {pool} --campaign {campaign} --purpose PURPOSE -- COMMAND; events {events}"]
-# Alternative: on_stop = ["herdr", "agent", "prompt", "{pane}", "--text", "slotr: stopped {run}: {reason}; re-queue with slotr run --pool {pool} --campaign {campaign} --purpose PURPOSE -- COMMAND"]
+# The pane prompt wakes the owning agent whatever {task} is, and fails harmlessly when the pane is gone.
+on_admit = ["herdr", "agent", "prompt", "{pane}", "slotr: admitted {run} ({pool} slot {slot}, port {port_base}): {purpose}; events {events}"]
+on_warn = ["herdr", "agent", "prompt", "{pane}", "slotr: warning {run}: {reason}; campaign {campaign}; events {events}"]
+on_stop = ["herdr", "agent", "prompt", "{pane}", "slotr: stopped {run}: {reason}; re-queue with slotr run --pool {pool} --campaign {campaign} --purpose PURPOSE -- COMMAND; events {events}"]
+# Ledger note instead: no --as, so the forwarded TASKR_TASK is the task.
+# on_stop = ["taskr", "note", "slotr: stopped {run}: {reason}; events {events}"]

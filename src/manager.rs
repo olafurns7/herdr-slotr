@@ -35,7 +35,20 @@ unsafe extern "C" {
 }
 pub fn signals() {
     // The handler only stores a lock-free atomic. Children reset handlers on exec.
+    // HUP: closing the terminal tab that runs `slotr run` stops the unit,
+    // unless HUP was inherited as ignored (nohup). /proc avoids a set-then-restore race.
+    let hup_ignored = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("SigIgn:"))
+                .and_then(|m| u64::from_str_radix(m.trim(), 16).ok())
+        })
+        .is_some_and(|mask| mask & 1 != 0);
     unsafe {
+        if !hup_ignored {
+            signal(1, handler);
+        }
         signal(2, handler);
         signal(15, handler);
     }
