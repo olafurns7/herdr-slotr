@@ -39,9 +39,10 @@ asset="slotr-$version-$target.tar.gz"
 tar --owner=0 --group=0 --numeric-owner --sort=name -czf "dist/$asset" \
     LICENSE THIRD-PARTY-NOTICES -C "target/$target/release" slotr
 strings "target/$target/release/slotr" > dist/binary-strings.txt
-tar --numeric-owner -tvzf "dist/$asset" > dist/archive-list.txt
+tar -tvzf "dist/$asset" > dist/archive-list.txt
 for listing in dist/binary-strings.txt dist/archive-list.txt; do
-    if grep -Eq '/home/|/Users/|/mnt/' "$listing" || grep -Fq "$(id -un)" "$listing"; then
+    if grep -Eq '/home/|/Users/|/mnt/' "$listing" || grep -Fq "$(id -un)" "$listing" ||
+        grep -Fq -e "$cargo_home" -e "$rustup_home" -e "$(pwd -P)" "$listing"; then
         echo "slotr: release contains a builder path or login name" >&2
         exit 1
     fi

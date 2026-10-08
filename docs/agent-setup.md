@@ -41,8 +41,7 @@ another path; see [configuration.md](configuration.md).
 ## herdr-setup
 
 herdr-setup's installer installs the same pinned release (v0.1.1) with the
-same checks as the quick agent setup block. It needs `gh` signed in with
-access to olafurns7/herdr-slotr; sign in with `gh auth login` or export
+same checks as the quick agent setup block. It needs `gh` signed in; sign in with `gh auth login` or export
 `GH_TOKEN`.
 
 ## Using slotr in a fleet

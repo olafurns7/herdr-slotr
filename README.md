@@ -10,8 +10,7 @@ of memory but does not remove it.
 
 ## Quick install
 
-You need Linux x86_64 and `gh` signed in with access to
-olafurns7/herdr-slotr. Paste this whole block:
+You need Linux x86_64 and `gh` signed in. Paste this whole block:
 
 ```sh
 d=$(mktemp -d) && a=slotr-0.1.1-x86_64-unknown-linux-musl.tar.gz &&

@@ -44,6 +44,7 @@ awk '$1 != "slotr" {sub(/^v/, "", $2); print $1, $2}' "$work/tree" | sort -u > "
         esac
         printf '\n\n'
     done < "$work/crates"
+    [ -r "$rust_doc/COPYRIGHT-library.html" ] || { echo "slotr: cannot read $rust_doc/COPYRIGHT-library.html" >&2; exit 1; }
     printf '=== Rust standard library %s ===\nLicense: MIT OR Apache-2.0\n\n' "$(rustc --version | cut -d' ' -f2)"
     sed -n '/<h2 id="longer-version">/,/<h2 id="in-tree-files">/p' "$rust_doc/COPYRIGHT-library.html" |
         sed '/^<h2 /d; s/<[^>]*>//g'

@@ -5,7 +5,7 @@ This file explains how to install slotr from a release or build it from source, 
 ## Requirements
 
 - Linux x86_64. Release builds exist only for this platform.
-- `gh` signed in with access to olafurns7/herdr-slotr.
+- `gh` signed in.
   Downloads go through `gh release download`.
 - To use `run`, `stop`, and the internal `_supervise` command: systemd 255.4
   or newer (the verified minimum for name-only `--setenv`) and a reachable
