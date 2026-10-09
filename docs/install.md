@@ -20,7 +20,7 @@ curl -fsSL https://github.com/olafurns7/herdr-slotr/releases/latest/download/ins
 
 The script:
 
-- Installs the exact version pinned in its `VERSION` line, currently 0.1.2.
+- Installs the exact version pinned in its `VERSION` line, currently 0.2.0.
 - Downloads the archive and checksum into a temporary directory.
 - Computes the hash itself and requires one checksum line naming that archive.
 - Accepts only regular files, exactly one `slotr`, and optional `LICENSE`
@@ -47,27 +47,27 @@ if a command fails.
 
    ```sh
    cd "$(mktemp -d)"
-   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.1.2/slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
-   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.1.2/slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz.sha256
+   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.2.0/slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz
+   curl -fsSLO https://github.com/olafurns7/herdr-slotr/releases/download/v0.2.0/slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256
    ```
 
 2. Verify the download. Go on only when it prints `OK`.
 
    ```sh
-   sha256sum -c slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz.sha256
+   sha256sum -c slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256
    ```
 
 3. Look at what the archive holds. It should list only `slotr`, `LICENSE`
    and `THIRD-PARTY-NOTICES`, each on a line that starts with `-`.
 
    ```sh
-   tar -tvzf slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
+   tar -tvzf slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz
    ```
 
 4. Extract the binary. Only `slotr` is taken out.
 
    ```sh
-   tar -xzf slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz slotr
+   tar -xzf slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz slotr
    ```
 
 5. Install it for your user.

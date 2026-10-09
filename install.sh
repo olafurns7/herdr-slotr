@@ -1,7 +1,7 @@
 #!/bin/sh
 
 main() {
-    VERSION=0.1.2
+    VERSION=0.2.0
     fail() { printf 'slotr install: %s\n' "$*" >&2; exit 1; }
     config_requested=false
     case "$#:${1:-}" in

@@ -5,13 +5,13 @@ shell=${SH:-sh}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' 0
 trap 'exit 1' HUP INT TERM
-asset=slotr-0.1.2-x86_64-unknown-linux-musl.tar.gz
+asset=slotr-0.2.0-x86_64-unknown-linux-musl.tar.gz
 release=$work/release
 mkdir "$release" "$work/members"
 cat >"$work/members/slotr" <<'STUB'
 #!/bin/sh
 case "$*" in
-    --version) echo 'slotr 0.1.2' ;;
+    --version) echo 'slotr 0.2.0' ;;
     "config check "*) [ -f "$3" ] && echo 'slotr: config OK' ;;
     *) exit 1 ;;
 esac
@@ -48,7 +48,7 @@ refused() {
         [ -z "$(find "$work/home/.local/bin" -name '.slotr.*' -print)" ] || fail 'left install temporary file'
 }
 run
-grep -q '^slotr 0.1.2$' "$work/out" || fail 'missing version'
+grep -q '^slotr 0.2.0$' "$work/out" || fail 'missing version'
 [ -x "$work/home/.local/bin/slotr" ] || fail 'binary is not executable'
 printf 'old binary\n' >"$work/home/.local/bin/slotr"
 run
@@ -69,7 +69,7 @@ mv "$work/home" "$work/saved-home"
 mv "$work/fresh" "$work/home"
 mv "$work/before" "$work/saved-before"
 refused 'slotr install: the checksum did not verify'
-sed 's/slotr-0.1.2/other-0.1.2/' "$work/good.sha256" >"$release/$asset.sha256"
+sed 's/slotr-0.2.0/other-0.2.0/' "$work/good.sha256" >"$release/$asset.sha256"
 refused 'slotr install: the checksum did not verify'
 cp "$work/good.sha256" "$release/$asset.sha256"
 cat "$work/good.sha256" >>"$release/$asset.sha256"
