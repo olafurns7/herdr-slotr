@@ -1,6 +1,6 @@
 [package]
 name = "slotr"
-version = "0.1.2"
+version = "0.2.0"
 license = "MIT"
 edition = "2024"
 description = "A local, fair, memory-aware resource admission queue"
