@@ -133,6 +133,9 @@ fn lease_action(
             && (admission::overdue(holder, now)
                 || admission::yielding(holder, s, pool)
                 || holder_idle(holder, cfg, now)
+                || head
+                    .as_ref()
+                    .is_some_and(|q| holder.request.level < q.level)
                 || (cfg.lease.idle_release_minutes > 0.0
                     && holder
                         .idle_since
@@ -197,6 +200,8 @@ fn lease_action(
                 "lease_expired"
             } else if holder_idle(&h, cfg, now) {
                 "holder_idle"
+            } else if head.as_ref().is_some_and(|q| h.request.level < q.level) {
+                "priority_yield"
             } else {
                 "idle_release"
             };
@@ -216,6 +221,8 @@ fn lease_action(
             "lease_expired"
         } else if holder_idle(&h, cfg, now) {
             "holder_idle"
+        } else if h.request.level < q.level {
+            "priority_yield"
         } else {
             "idle_release"
         };
@@ -314,6 +321,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                 };
                 let sample = stats::read();
                 let now = manager::now();
+                let level = cfg.priority.level(&h.request.campaign, &h.request.task);
                 memory_count = if sample
                     .available_mib
                     .is_some_and(|v| v < cfg.watchdog.stop_available_mib as f64)
@@ -362,6 +370,12 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                             now,
                         );
                     }
+                    s.holders
+                        .iter_mut()
+                        .find(|h| h.run == run)
+                        .unwrap()
+                        .request
+                        .level = level;
                     admission::update_recovery(s, &sample, cfg, now);
                     let fitting_waiter = query_error.is_none()
                         && admission::head(s, &h.request.pool, cfg).is_some_and(|q| {
@@ -392,7 +406,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                             holder.idle_since = None;
                         }
                     }
-                    let newest = s
+                    let victim = s
                         .holders
                         .iter()
                         .filter(|h| {
@@ -400,10 +414,10 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                                 && h.stopping_at.is_none()
                                 && cfg.pools.get(&h.request.pool).is_some_and(|p| p.evictable)
                         })
-                        .max_by_key(|h| h.admit_seq);
+                        .min_by_key(|h| (h.request.level, std::cmp::Reverse(h.admit_seq)));
                     let mut action = Action::default();
                     if cfg.pools[&h.request.pool].evictable
-                        && newest.is_some_and(|h| h.run == run)
+                        && victim.is_some_and(|h| h.run == run)
                         && s.last_stop.as_ref().is_none_or(|stop| {
                             now - stop.at
                                 >= cfg
@@ -459,6 +473,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                 }
                 if let Some((holder, reason, snapshot)) = action.stop {
                     manager::kill_group(&child, rustix::process::Signal::TERM)?;
+                    eprintln!("slotr: stopped {}: {}", holder.run, reason);
                     let deadline =
                         Instant::now() + Duration::from_secs_f64(cfg.watchdog.term_grace_seconds);
                     let _ = manager::stop_event(cfg, &holder, &reason, &snapshot, &obs, &sample);
@@ -503,6 +518,7 @@ fn warn_once_when_an_effective_head_returns() {
         enqueue_seq: seq,
         pool: "default".into(),
         campaign: campaign.into(),
+        level: 0,
         purpose: "check".into(),
         task: String::new(),
         pane: String::new(),
@@ -643,6 +659,70 @@ mod holder_tests {
         fn drop(&mut self) {
             fs::remove_file(&self.script).unwrap();
         }
+    }
+
+    #[test]
+    fn priority_yield_warns_and_stops_one_oldest_fitting_holder() {
+        let mut f = Fixture::new();
+        f.cfg.lease.holder_probe.clear();
+        f.cfg.lease.waiter_min_wait_seconds = 5.0;
+        f.cfg.pools.get_mut("default").unwrap().slots = 2;
+        let mut newer = f.state.holders[0].clone();
+        newer.run = "slotr-default-2".into();
+        newer.admit_seq = 2;
+        newer.slot = 1;
+        newer.request.campaign = "newer".into();
+        f.state.holders.push(newer);
+        f.waiter();
+        f.state.queue[0].level = 1;
+        assert!(f.action(4.0).warn.is_none());
+        assert_eq!(f.action(5.0).warn.unwrap().1, "priority_yield");
+        assert_eq!(
+            f.state.queue[0].stop_claimed_by.as_deref(),
+            Some("slotr-default-1")
+        );
+        assert!(
+            lease_action(
+                &mut f.state,
+                "slotr-default-2",
+                &f.cfg,
+                &BTreeMap::new(),
+                &stats::Stats::default(),
+                5.0
+            )
+            .warn
+            .is_none()
+        );
+        assert!(f.action(9.0).stop.is_none());
+        assert_eq!(f.action(10.0).stop.unwrap().1, "priority_yield");
+        assert_eq!(f.state.holders[1].warned_for, None);
+    }
+
+    #[test]
+    fn priority_arrival_cancels_claim_and_rewarns_for_new_head() {
+        let mut f = Fixture::new();
+        f.cfg.lease.holder_probe.clear();
+        f.cfg.lease.waiter_min_wait_seconds = 5.0;
+        f.state.holders[0].lease_expires_at = Some(1.0);
+        f.waiter();
+        assert_eq!(f.action(10.0).warn.unwrap().1, "lease_expired");
+        let mut priority = f.state.queue[0].clone();
+        priority.enqueue_seq = 3;
+        priority.campaign = "priority".into();
+        priority.level = 1;
+        priority.since = 11.0;
+        priority.stop_claimed_by = None;
+        f.state.queue.push(priority);
+        let cancelled = f.action(11.0);
+        assert!(cancelled.cancelled.is_some());
+        assert!(cancelled.warn.is_none() && cancelled.stop.is_none());
+        assert!(f.state.queue[0].stop_claimed_by.is_none());
+        assert!(f.action(15.0).warn.is_none());
+        assert!(f.action(16.0).warn.is_some());
+        assert_eq!(f.state.holders[0].warned_for, Some(3));
+        assert!(f.action(20.0).stop.is_none());
+        assert!(f.action(21.0).stop.is_some());
+        assert!(f.state.queue[0].stop_claimed_by.is_none());
     }
 
     #[test]

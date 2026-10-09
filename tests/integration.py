@@ -59,8 +59,9 @@ if name == 'taskr':
         log.write(json.dumps(dict(args=args, task=os.environ.get('TASKR_TASK'), launch=os.environ.get('TASKR_LAUNCH'))) + '\n')
     sys.exit(int(os.environ.get('NOTE_EXIT', '0')))
 if name == 'systemd-run':
+    unit = args[args.index('--unit') + 1]
     # Admission must keep its shared compatibility lock through unit startup.
-    with (root / "legacy.lock").open("a") as legacy:
+    with (root / ('legacy-heavy.lock' if unit.startswith('slotr-heavy-') else 'legacy.lock')).open("a") as legacy:
         try:
             fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -68,7 +69,6 @@ if name == 'systemd-run':
         else:
             print("shared legacy lock lost during startup", file=sys.stderr)
             sys.exit(9)
-    unit = args[args.index('--unit') + 1]
     if (root / 'collision').exists():
         (root / 'collision').unlink()
         print('Failed to start transient service unit: Unit %s.service was already loaded or has a fragment file.' % unit, file=sys.stderr)
@@ -112,7 +112,7 @@ WORKLOAD = r'''
 import json, os, pathlib, signal, sys, time
 path = pathlib.Path(sys.argv[1])
 path.write_text(json.dumps(dict(pid=os.getpid(), slot=os.environ['SLOTR_SLOT'],
-                               base=os.environ['SLOTR_PORT_BASE'], run=os.environ['SLOTR_RUN'],
+                               base=os.environ.get('SLOTR_PORT_BASE', ''), run=os.environ['SLOTR_RUN'],
                                literal=sys.argv[2:])))
 def terminated(s, f):
     path.with_suffix(".term").write_text("TERM")
@@ -185,6 +185,14 @@ class AdmissionTest(unittest.TestCase):
                               on_stop=self.cfg.get("on_stop", ["taskr", "note", "{task}", "{reason}"])))
         if "unknown" in self.cfg:
             cfg["unknown"] = self.cfg["unknown"]
+        if "priority" in self.cfg:
+            cfg["priority"] = self.cfg["priority"]
+        if "heavy" in self.cfg:
+            cfg["pools"]["heavy"] = dict(slots=2, memory_gated=True, evictable=True,
+                default_cost_mib=6144, max_lease="1h", campaign_cap=0,
+                ports=dict(base=self.cfg['ports']['base'] + 64, stride=32, probe=7),
+                legacy_lock=dict(path=str(self.runtime / 'legacy-heavy.lock'), mode='shared'))
+            cfg['pools']['heavy'].update(self.cfg['heavy'])
         lines = []
         def table(obj, prefix=""):
             if prefix:
@@ -235,13 +243,37 @@ class AdmissionTest(unittest.TestCase):
             threading.Event().wait(0.04)
         self.fail('condition timed out; logs: ' + ' '.join(p.read_text() for p in self.logs))
 
-    def start(self, label, *literal, campaign=None, lease=None, task='test-task', pane='test-pane', **popen):
+    def freeze(self, pid):
+        # Stop only outside a state transaction so other slotr processes can proceed.
+        lock = self.runtime / 'slotr/state.lock'
+        while True:
+            os.kill(pid, signal.SIGSTOP)
+            threading.Event().wait(0.01)
+            with lock.open('a') as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    pass
+            os.kill(pid, signal.SIGCONT)
+            threading.Event().wait(0.01)
+
+    def priority_file(self, text):
+        path = self.root / 'priority'
+        pending = path.with_suffix('.tmp')
+        pending.write_bytes(text.encode() if isinstance(text, str) else text)
+        pending.replace(path)
+        return path
+
+    def start(self, label, *literal, campaign=None, lease=None, task='test-task', pane='test-pane', pool='runtime', cost=None, **popen):
         output = self.root / label
         log = self.root / (label + '.log')
         self.logs.append(log)
         self.workloads.append(output)
         with log.open('w') as stream:
-            child = subprocess.Popen([str(TOOL), 'run', '--pool', 'runtime', '--kind', 'dev-stack', '--campaign', campaign or label,
+            child = subprocess.Popen([str(TOOL), 'run', '--pool', pool,
+                                      *(['--cost', str(cost)] if cost is not None else ['--kind', 'dev-stack'] if pool == 'runtime' else []),
+                                      '--campaign', campaign or label,
                                       '--purpose', label, '--task', task, '--pane', pane,
                                       *(['--lease', lease] if lease else []), '--',
                                       sys.executable, '-c', WORKLOAD, str(output), *literal], env=self.env,
@@ -517,7 +549,7 @@ class AdmissionTest(unittest.TestCase):
         self.wait(lambda: len(self.status()["queue"]) == 1)
         third, p3 = self.start("third", campaign="B")
         self.wait(lambda: len(self.status()["queue"]) == 2)
-        self.wait(lambda: self.status()["queue"][0]["wait_reason"] == "campaign_cap")
+        self.wait(lambda: any(q['campaign'] == 'A' and q['wait_reason'] == 'campaign_cap' for q in self.status()['queue']))
         self.assertFalse(p2.exists())
         self.set_stats(40000)
         self.wait(p3.exists)
@@ -1039,12 +1071,13 @@ class AdmissionTest(unittest.TestCase):
             h = state["holders"][0]
             self.assertIsInstance(h["admitted_at"], (float,int))
             self.assertLess(abs(h["admitted_at"] - time.clock_gettime(time.CLOCK_BOOTTIME)), 2)
-            for key in ["stopping_at", "warned_at", "warned_for", "warned_waiters", "idle_since", "cpu_usage_usec", "cpu_sample_at", "lease_expires_at"]:
+            for key in ["level", "stopping_at", "warned_at", "warned_for", "warned_waiters", "idle_since", "cpu_usage_usec", "cpu_sample_at", "lease_expires_at"]:
                 h.pop(key, None)
             pending = path.with_suffix(".upgrade")
             pending.write_text(json.dumps(state))
             pending.replace(path)
             view = self.status()["slots"][0]
+            self.assertEqual(view['level'], 0)
             self.assertTrue(view["admitted_at"].endswith("Z"))
         finally:
             os.kill(supervisor_pid, signal.SIGCONT)
@@ -1515,6 +1548,435 @@ class AdmissionTest(unittest.TestCase):
         events.mkdir()
         result = self.invoke('touch', h['run'])
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_priority_unknown_pool_in_queue_does_not_kill_waiter(self):
+        self.cfg.update(priority=dict(campaigns=['H']))
+        self.write_config()
+        self.set_stats(10000)
+        saved = self.env
+        self.env = dict(saved, SLOTR_POOLS__HEAVY__SLOTS='1')
+        try:
+            heavy, _ = self.start('H', pool='heavy', cost=7000)
+        finally:
+            self.env = saved
+        self.wait(lambda: 'memory_budget' in (self.root / 'H.log').read_text())
+        low, w = self.start('W', cost=1024)
+        self.wait(w.exists, timeout=3)
+        self.assertIsNone(low.poll())
+        self.assertIsNone(heavy.poll())
+        self.assertEqual(self.status()['slots'][0]['campaign'], 'W')
+
+    def test_priority_head_passes_fifo_within_pool(self):
+        self.cfg.update(runtime_slots=1, waiter_age=1000, priority=dict(campaigns=['P']))
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('holder')
+        self.admitted('holder', output)
+        low, n = self.start('N')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        high, p = self.start('P')
+        self.wait(lambda: [q['campaign'] for q in self.status()['queue']] == ['P', 'N'])
+        self.wait(lambda: self.status()['queue'][0]['level'] == 1)
+        # Freeze only owned waiters so status can observe the newly free slot.
+        self.freeze(low.pid)
+        self.freeze(high.pid)
+        try:
+            holder.terminate()
+            holder.wait(timeout=3)
+            self.wait(lambda: [q['wait_reason'] for q in self.status()['queue']] == ['ready', 'fifo'])
+        finally:
+            os.kill(low.pid, signal.SIGCONT)
+            os.kill(high.pid, signal.SIGCONT)
+        self.wait(p.exists)
+        self.assertFalse(n.exists())
+        high.terminate()
+        high.wait(timeout=3)
+        self.wait(n.exists)
+
+    def test_priority_within_level_stays_fifo(self):
+        self.cfg.update(runtime_slots=1, waiter_age=1000, priority=dict(campaigns=['P*']))
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('holder')
+        self.admitted('holder', output)
+        first, p1 = self.start('P1')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        _, p2 = self.start('P2')
+        self.wait(lambda: len(self.status()['queue']) == 2 and all(q['level'] == 1 for q in self.status()['queue']))
+        self.assertEqual([q['campaign'] for q in self.status()['queue']], ['P1', 'P2'])
+        holder.terminate()
+        holder.wait(timeout=3)
+        self.wait(p1.exists)
+        self.assertFalse(p2.exists())
+        first.terminate()
+        first.wait(timeout=3)
+        self.wait(p2.exists)
+
+    def test_priority_does_not_pass_campaign_cap(self):
+        self.cfg.update(priority=dict(campaigns=['P']), grace=1)
+        self.write_config()
+        self.set_stats(40000)
+        first, output = self.start('first', campaign='P')
+        self.wait(output.exists)
+        self.set_stats(10000)
+        second, p2 = self.start('second', campaign='P')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        lower, n = self.start('N')
+        self.wait(lambda: len(self.status()['queue']) == 2)
+        self.wait(lambda: [q['wait_reason'] for q in self.status()['queue']] == ['memory_budget', 'campaign_cap'])
+        self.set_stats(40000)
+        self.wait(n.exists)
+        self.assertEqual(self.status()['queue'][0]['wait_reason'], 'no_slot')
+        self.pause(0.4)
+        self.assertFalse(p2.exists())
+        self.assertIsNone(first.poll())
+        self.assertIsNone(lower.poll())
+        self.assertIsNone(second.poll())
+        self.assertEqual(self.events('warn'), [])
+        self.assertEqual(self.events('stop'), [])
+
+    def test_priority_file_adds_and_hub_lifts(self):
+        path = self.priority_file('campaign N 2\n')
+        self.cfg.update(runtime_slots=1, waiter_age=1000, priority=dict(campaigns=['P'], file=str(path)))
+        self.write_config()
+        holder, output = self.start('holder')
+        self.admitted('holder', output)
+        _, n = self.start('N')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        high, p = self.start('P')
+        self.wait(lambda: self.status()['queue'][0]['campaign'] == 'N' and self.status()['queue'][0]['level'] == 2)
+        path.rename(path.with_suffix('.removed'))
+        self.wait(lambda: self.status()['queue'][0]['campaign'] == 'P' and all(q['level'] <= 1 for q in self.status()['queue']))
+        self.priority_file('campaign cop* 3\ntask special 4\ncampaign P 0\n')
+        self.start('copilot-x')
+        self.start('by-task', task='special')
+        self.wait(lambda: len(self.status()['queue']) == 4 and self.status()['queue'][0]['level'] == 4)
+        self.assertEqual([(q['campaign'], q['level']) for q in self.status()['queue']],
+                         [('by-task', 4), ('copilot-x', 3), ('P', 1), ('N', 0)])
+        self.priority_file('')
+        self.wait(lambda: all(q['level'] == (1 if q['campaign'] == 'P' else 0) for q in self.status()['queue']))
+        self.wait(lambda: self.status()['queue'][0]['campaign'] == 'P')
+        holder.terminate()
+        holder.wait(timeout=3)
+        self.wait(p.exists)
+        self.assertFalse(n.exists())
+        high.terminate()
+        high.wait(timeout=3)
+        self.wait(n.exists)
+
+    def test_priority_file_malformed_and_torn_is_ignored(self):
+        path = self.priority_file(b'# comment\n\ngarbage\ncampaign N -1\ntask test-task 4294967296\ncampaign N 2 extra\ncampaign N 2\n\xff\ncampaign P')
+        self.cfg.update(runtime_slots=1, waiter_age=1000, priority=dict(campaigns=['P', 'holder'], file=str(path)))
+        self.write_config()
+        _, output = self.start('holder')
+        self.admitted('holder', output)
+        self.start('P')
+        self.start('N')
+        self.wait(lambda: len(self.status()['queue']) == 2 and self.status()['queue'][0]['level'] == 2)
+        self.assertEqual([(q['campaign'], q['level']) for q in self.status()['queue']], [('N', 2), ('P', 1)])
+        path.unlink()
+        path.mkdir() # An unreadable source also falls back to static matches.
+        self.wait(lambda: self.status()['queue'][0]['campaign'] == 'P' and self.status()['priority']['state'] == 'missing')
+        path.rmdir()
+        os.mkfifo(path)
+        for source in ('fifo', 'oversize'):
+            if source == 'oversize':
+                self.priority_file(b'campaign N 9\n' + b' ' * (65537 - len(b'campaign N 9\n')))
+            self.wait(lambda: self.status()['priority']['state'] == 'missing')
+            self.wait(lambda: [(q['campaign'], q['level']) for q in self.status()['queue']] == [('P', 1), ('N', 0)])
+            self.wait(lambda: self.status()['slots'][0]['level'] == 1)
+        self.priority_file(b'campaign N 2\n' + b' ' * (65536 - len(b'campaign N 2\n')))
+        self.wait(lambda: self.status()['priority']['state'] == 'ok' and self.status()['queue'][0]['level'] == 2)
+        self.assertEqual(self.events('waiter_tick_error'), [])
+        self.assertEqual(self.events('supervisor_tick_error'), [])
+
+    def test_priority_wait_holds_lower_waiter_only_while_higher_is_admissible(self):
+        self.configure_clock()
+        self.cfg.update(heavy={}, waiter_age=1000, priority=dict(campaigns=['V']))
+        self.write_config()
+        self.set_stats(8000)
+        high, v = self.start('V', pool='heavy')
+        self.wait(lambda: len(self.status()['pools']['heavy']['queue']) == 1 and self.status()['pools']['heavy']['queue'][0]['level'] == 1)
+        self.freeze(high.pid)
+        try:
+            _, w = self.start('W', cost=3072)
+            self.wait(lambda: len(self.status()['queue']) == 1)
+            self.set_stats(20000)
+            self.wait(lambda: self.status()['queue'][0]['wait_reason'] == 'priority_wait')
+            self.wait(lambda: 'priority_wait' in (self.root / 'W.log').read_text())
+            self.assertFalse(w.exists())
+        finally:
+            os.kill(high.pid, signal.SIGCONT)
+        self.wait(v.exists)
+        self.wait(w.exists)
+        # In a fresh state V cannot fit, while the smaller W can.
+        for child in self.children:
+            child.terminate()
+            child.wait(timeout=3)
+        self.wait(lambda: not self.status()['pools']['heavy']['holders'] and not self.status()['pools']['runtime']['holders'])
+        self.set_stats(9000)
+        high2, v2 = self.start('V2', campaign='V', pool='heavy')
+        self.wait(lambda: len(self.status()['pools']['heavy']['queue']) == 1)
+        _, w2 = self.start('W2', cost=3072)
+        self.wait(w2.exists)
+        self.assertFalse(v2.exists())
+        self.assertIsNone(high2.poll())
+        self.assertEqual(self.status()['pools']['heavy']['queue'][0]['wait_reason'], 'memory_budget')
+        self.assertNotIn('priority_wait', (self.root / 'W2.log').read_text())
+        self.freeze(high2.pid)
+        try:
+            self.set_stats(40000)
+            _, w3 = self.start('W3', cost=1024)
+            self.wait(lambda: bool(self.status()['queue']) and self.status()['queue'][0]['wait_reason'] == 'priority_wait')
+            self.advance(6) # The higher head's frozen heartbeat is now stale.
+            self.wait(w3.exists)
+            self.assertFalse(v2.exists())
+        finally:
+            os.kill(high2.pid, signal.SIGCONT)
+        self.wait(v2.exists)
+
+    def test_priority_wait_ends_when_higher_waiter_is_blocked_by_ports_or_legacy(self):
+        # S7 rewritten so the higher waiter stays live: only "not admissible" can release W.
+        self.cfg.update(heavy={}, waiter_age=1000, priority=dict(campaigns=['V']))
+        self.write_config()
+        self.set_stats(8000)
+        high, v = self.start('V', pool='heavy')
+        self.wait(lambda: len(self.status()['pools']['heavy']['queue']) == 1 and self.status()['pools']['heavy']['queue'][0]['level'] == 1)
+        heavy_q = lambda: self.status()['pools']['heavy']['queue'][0]['wait_reason']
+        lock = (self.runtime / 'legacy-heavy.lock').open('a')
+        try:
+            with contextlib.ExitStack() as stack:
+                base = self.cfg['ports']['base'] + 64
+                for port in [base, base + 32]:
+                    stack.enter_context(socket.socket()).bind(('127.0.0.1', port))
+                _, w = self.start('W', cost=3072)
+                self.wait(lambda: len(self.status()['queue']) == 1)
+                self.set_stats(30000)
+                self.wait(lambda: heavy_q() == 'ports_busy')
+                self.wait(w.exists, timeout=3)
+                self.assertEqual(heavy_q(), 'ports_busy')
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # before the ports free up
+            self.wait(lambda: heavy_q() == 'legacy_lock')
+            _, w2 = self.start('W2', cost=3072)
+            self.wait(w2.exists, timeout=3)
+            self.assertEqual(heavy_q(), 'legacy_lock')
+            self.assertIsNone(high.poll())
+            self.assertFalse(v.exists())
+        finally:
+            lock.close()
+        self.wait(v.exists)
+
+    def test_pressure_victim_lowest_level_first(self):
+        self.cfg.update(priority=dict(campaigns=['P']), recovery_healthy_seconds=10)
+        self.write_config()
+        self.set_stats(40000)
+        low, n = self.start('N')
+        self.admitted('N', n)
+        high, p = self.start('P')
+        self.admitted('P', p)
+        self.wait(lambda: next(h for h in self.status()['slots'] if h['campaign'] == 'P')['level'] == 1)
+        self.set_stats(3000)
+        self.wait(lambda: low.poll() is not None)
+        self.assertEqual(low.returncode, 75)
+        self.assertIsNone(high.poll())
+        self.assertEqual([e['run'] for e in self.events('stop')], ['slotr-runtime-1'])
+
+    def test_pressure_victim_newest_within_level(self):
+        self.cfg.update(priority=dict(campaigns=['old', 'new']))
+        self.write_config()
+        self.check_stop(3000, 0, 'stop_available_mib', two=True)
+
+    def test_priority_yield_stops_lowest_holder_for_higher_head(self):
+        self.cfg.update(priority=dict(campaigns=['P']), waiter_age=0.3, grace=0.3)
+        self.write_config()
+        self.set_stats(40000)
+        old, n1 = self.start('N1')
+        self.admitted('N1', n1)
+        other, n2 = self.start('N2')
+        self.admitted('N2', n2)
+        _, p = self.start('P')
+        self.wait(lambda: bool(self.status()['queue']))
+        self.wait(lambda: bool(self.events('warn')))
+        self.assertEqual([(e['run'], e['reason']) for e in self.events('warn')], [('slotr-runtime-1', 'priority_yield')])
+        self.assertIsNone(old.poll())
+        self.wait(lambda: old.poll() is not None)
+        self.assertEqual(old.returncode, 75)
+        self.wait(p.exists)
+        self.assertIsNone(other.poll())
+        self.assertEqual([(e['run'], e['reason']) for e in self.events('stop')], [('slotr-runtime-1', 'priority_yield')])
+
+    def test_priority_yield_never_targets_equal_level_or_same_campaign(self):
+        path = self.priority_file('task promoted 2\n')
+        self.cfg.update(runtime_slots=1, priority=dict(campaigns=['P*'], file=str(path)))
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('P1')
+        self.admitted('P1', output)
+        equal, _ = self.start('P2')
+        self.wait(lambda: bool(self.status()['queue']) and self.status()['queue'][0]['level'] == 1)
+        self.pause(0.6)
+        self.assertEqual(self.events('warn'), [])
+        equal.terminate()
+        equal.wait(timeout=3)
+        self.wait(lambda: not self.status()['queue'])
+        self.start('same', campaign='P1', task='promoted')
+        self.wait(lambda: bool(self.status()['queue']) and self.status()['queue'][0]['level'] == 2)
+        self.pause(0.6)
+        self.assertEqual(self.events('warn'), [])
+        self.assertEqual(self.events('stop'), [])
+        self.assertIsNone(holder.poll())
+
+    def test_priority_arrival_cancels_claim_and_rewarns(self):
+        self.cfg.update(runtime_slots=1, priority=dict(campaigns=['P']), grace=1, waiter_age=0.2)
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('holder', lease='0.1s')
+        self.admitted('holder', output)
+        lower, n = self.start('N')
+        self.wait(lambda: bool(self.events('warn')))
+        self.assertIsNotNone(self.status()['queue'][0]['stop_claimed_by'])
+        high, p = self.start('P')
+        self.wait(lambda: bool(self.events('warn_cancelled')))
+        self.wait(lambda: next(q for q in self.status()['queue'] if q['campaign'] == 'N')['stop_claimed_by'] is None)
+        self.wait(lambda: len(self.events('warn')) == 2)
+        self.assertEqual(self.status()['queue'][0]['campaign'], 'P')
+        self.wait(lambda: holder.poll() is not None)
+        self.assertEqual(holder.returncode, 75)
+        self.wait(p.exists)
+        self.assertFalse(n.exists())
+        self.assertIsNone(self.status()['queue'][0]['stop_claimed_by'])
+        self.assertEqual(len(self.events('stop')), 1)
+        high.terminate()
+        high.wait(timeout=3)
+        self.wait(n.exists)
+        self.assertIsNone(lower.poll())
+
+    def test_heavy_pool_two_shared_holders_and_old_exclusive_flock(self):
+        self.cfg.update(heavy={})
+        self.write_config()
+        self.set_stats(40000)
+        first, h1 = self.start('H1', pool='heavy')
+        self.wait(h1.exists)
+        second, h2 = self.start('H2', pool='heavy')
+        self.wait(h2.exists)
+        path = self.runtime / 'legacy-heavy.lock'
+        self.assertNotEqual(subprocess.run(['flock', '-xn', str(path), 'true']).returncode, 0)
+        first.terminate()
+        second.terminate()
+        first.wait(timeout=3)
+        second.wait(timeout=3)
+        self.wait(lambda: not self.status()['pools']['heavy']['holders'])
+        marker = self.root / 'exclusive-ready'
+        external = subprocess.Popen(['flock', '-x', str(path), sys.executable, '-c',
+            'import pathlib,sys; pathlib.Path(sys.argv[1]).touch(); sys.stdin.read()', str(marker)], stdin=subprocess.PIPE)
+        self.children.append(external)
+        try:
+            self.wait(marker.exists)
+            waiter, h3 = self.start('H3', pool='heavy')
+            self.wait(lambda: bool(self.status()['pools']['heavy']['queue']) and self.status()['pools']['heavy']['queue'][0]['wait_reason'] == 'legacy_lock')
+            q = self.status()['pools']['heavy']['queue'][0]
+            self.assertIsInstance(q['legacy_holder_pid'], int)
+            self.assertIn('holder pid', (self.root / 'H3.log').read_text())
+            self.assertFalse(h3.exists())
+        finally:
+            external.communicate(timeout=3)
+        self.wait(h3.exists)
+        self.assertIsNone(waiter.poll())
+
+    def test_stopped_heavy_run_exits_75_with_reason_on_stderr(self):
+        self.cfg.update(heavy={})
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('H', pool='heavy')
+        self.wait(output.exists)
+        self.set_stats(3000)
+        self.wait(lambda: holder.poll() is not None)
+        self.assertEqual(holder.returncode, 75)
+        self.assertEqual((self.root / 'H.log').read_text().count('slotr: stopped slotr-heavy-1: stop_available_mib'), 1)
+
+    def test_status_reports_levels_and_priority_source(self):
+        self.assertEqual(self.status()['priority'], {'state': 'off'})
+        defaults = json.loads(self.invoke('config', 'show').stdout)
+        self.assertEqual(defaults['config']['priority'], dict(campaigns=[], file=''))
+        self.assertEqual(defaults['sources']['priority.file'], 'default')
+        path = self.priority_file('campaign N 2\n')
+        self.env['HOME'] = str(self.root)
+        self.cfg.update(runtime_slots=1, waiter_age=1000, priority=dict(campaigns=['P'], file='~/priority'))
+        self.write_config()
+        shown = json.loads(self.invoke('config', 'show').stdout)
+        self.assertEqual(shown['config']['priority'], dict(campaigns=['P'], file='~/priority'))
+        self.assertEqual(shown['sources']['priority.file'], 'file')
+        self.assertEqual(self.invoke('config', 'check').returncode, 0)
+        override = dict(self.env, SLOTR_PRIORITY__CAMPAIGNS='["X*"]', SLOTR_PRIORITY__FILE='')
+        shown = json.loads(self.invoke('config', 'show', env=override).stdout)
+        self.assertEqual(shown['config']['priority'], dict(campaigns=['X*'], file=''))
+        self.assertEqual(shown['sources']['priority.campaigns'], 'env')
+        self.assertEqual(shown['sources']['priority.file'], 'env')
+        self.assertEqual(self.invoke('config', 'check', env=override).returncode, 0)
+        holder, output = self.start('holder')
+        self.admitted('holder', output)
+        _, n = self.start('N')
+        self.wait(lambda: len(self.status()['queue']) == 1)
+        high, p = self.start('P')
+        self.wait(lambda: len(self.status()['queue']) == 2 and self.status()['queue'][0]['level'] == 2)
+        view = self.status()
+        self.assertEqual(view['schema_version'], 1)
+        self.assertEqual(view['slots'][0]['level'], 0)
+        self.assertEqual([q['campaign'] for q in view['queue']], ['N', 'P'])
+        self.assertEqual([q['position'] for q in view['queue']], [1, 2])
+        self.assertEqual(view['priority']['state'], 'ok')
+        self.assertIsInstance(view['priority']['age_seconds'], int)
+        text = self.invoke('status').stdout
+        self.assertIn('level=0', text)
+        self.assertIn('level=2', text)
+        self.assertIn('Priority:', text)
+        path.rename(path.with_suffix('.removed'))
+        self.assertEqual(self.status()['priority']['state'], 'missing')
+        # Old schema-1 state without levels still loads; owners refresh afterward.
+        state_path = self.runtime / 'slotr/state.json'
+        supervisor_pid = int((self.runtime / view['slots'][0]['run']).read_text())
+        frozen = [child.pid for child in self.children] + [supervisor_pid]
+        for pid in frozen:
+            self.freeze(pid)
+        try:
+            snapshot = json.loads(state_path.read_text())
+            for run in snapshot['holders'] + snapshot['queue']:
+                run.pop('level', None)
+            pending = state_path.with_suffix('.upgrade')
+            pending.write_text(json.dumps(snapshot))
+            pending.replace(state_path)
+            upgraded = self.status()
+            self.assertEqual(upgraded['schema_version'], 1)
+            self.assertTrue(all(run['level'] == 0 for run in upgraded['slots'] + upgraded['queue']))
+        finally:
+            for pid in frozen:
+                os.kill(pid, signal.SIGCONT)
+        self.wait(lambda: self.status()['queue'][0]['campaign'] == 'P')
+        holder.terminate()
+        holder.wait(timeout=3)
+        self.wait(p.exists)
+        self.assertFalse(n.exists())
+        high.terminate()
+        high.wait(timeout=3)
+        self.wait(n.exists)
+
+    def test_running_holder_level_follows_the_file(self):
+        path = self.priority_file('')
+        self.cfg.update(priority=dict(file=str(path)), recovery_healthy_seconds=10)
+        self.write_config()
+        self.set_stats(40000)
+        other, n = self.start('N')
+        self.admitted('N', n)
+        promoted, p = self.start('P')
+        self.admitted('P', p)
+        self.assertTrue(all(h['level'] == 0 for h in self.status()['slots']))
+        self.priority_file('campaign P 2\n')
+        self.wait(lambda: next(h for h in self.status()['slots'] if h['campaign'] == 'P')['level'] == 2)
+        self.set_stats(3000)
+        self.wait(lambda: other.poll() is not None)
+        self.assertEqual(other.returncode, 75)
+        self.assertIsNone(promoted.poll())
+        self.assertEqual([e['run'] for e in self.events('stop')], ['slotr-runtime-1'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=True)

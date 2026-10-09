@@ -76,6 +76,7 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
             enqueue_seq: seq,
             pool: args.pool.clone(),
             campaign: args.campaign.clone(),
+            level: 0,
             purpose: args.purpose.clone(),
             task: args.task.clone(),
             pane: args.pane.clone(),
@@ -96,6 +97,7 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                 let obs = manager::observations(&state::read(&state::root())?)?;
                 let sample = stats::read();
                 let now = manager::now();
+                let level = cfg.priority.level(&args.campaign, &args.task);
                 let (legacy_ok, legacy_file) = manager::legacy(pool, false)?;
                 let (holder, reason) = state::transaction(|s| {
                     manager::reconcile(s, &obs);
@@ -107,6 +109,7 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                         .find(|q| q.enqueue_seq == seq)
                         .ok_or_else(|| anyhow::anyhow!("ticket disappeared"))?;
                     q.seen_at = now;
+                    q.level = level;
                     let q = q.clone();
                     let (slot, mut reason) =
                         admission::decide(s, &q, cfg, &obs, &sample, now, |slot| {
@@ -119,6 +122,10 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                     }
                     if admission::head(s, &args.pool, cfg).is_none_or(|q| q.enqueue_seq != seq) {
                         reason = Some(reason.unwrap_or("fifo"));
+                    }
+                    if reason.is_none() && admission::priority_wait(s, &q, cfg, &obs, &sample, now)
+                    {
+                        reason = Some("priority_wait");
                     }
                     if reason.is_some() {
                         return Ok((None, reason));
@@ -400,10 +407,16 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
                 data
             })
             .collect();
-        let queue: Vec<_> = s
-            .queue
-            .iter()
-            .filter(|q| q.pool == *name)
+        let mut ordered: Vec<_> = s.queue.iter().filter(|q| q.pool == *name).collect();
+        ordered.sort_by_key(|q| {
+            (
+                admission::cap_blocked(&s, q, cfg),
+                std::cmp::Reverse(q.level),
+                q.enqueue_seq,
+            )
+        });
+        let queue: Vec<_> = ordered
+            .into_iter()
             .enumerate()
             .map(|(i, q)| {
                 let (_, mut reason) = admission::decide(&s, q, cfg, &obs, &sample, now, |slot| {
@@ -414,20 +427,18 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
                 if reason.is_none() && !legacy_ok {
                     reason = Some("legacy_lock");
                 }
+                if admission::head(&s, name, cfg)
+                    .is_none_or(|first| first.enqueue_seq != q.enqueue_seq)
+                {
+                    reason = Some(reason.unwrap_or("fifo"));
+                }
+                if reason.is_none() && admission::priority_wait(&s, q, cfg, &obs, &sample, now) {
+                    reason = Some("priority_wait");
+                }
                 let mut data = serde_json::to_value(q).unwrap();
                 let _ = crate::timestamp::display(&mut data);
                 data["position"] = json!(i + 1);
-                data["wait_reason"] = json!(
-                    reason.unwrap_or(
-                        if admission::head(&s, name, cfg)
-                            .is_some_and(|first| first.enqueue_seq == q.enqueue_seq)
-                        {
-                            "ready"
-                        } else {
-                            "fifo"
-                        }
-                    )
-                );
+                data["wait_reason"] = json!(reason.unwrap_or("ready"));
                 if reason == Some("legacy_lock") {
                     data["legacy_holder_pid"] = json!(manager::legacy_pid(pool));
                 }
@@ -439,11 +450,12 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
     }
     let mut last_stop = serde_json::to_value(&s.last_stop)?;
     crate::timestamp::display(&mut last_stop)?;
-    let data = json!({"schema_version":1,"stats":sample,"pools":pools,"last_stop":last_stop,"events_path":manager::events_path()});
+    let data = json!({"schema_version":1,"stats":sample,"pools":pools,"priority":cfg.priority.status(),"last_stop":last_stop,"events_path":manager::events_path()});
     if as_json {
         println!("{}", serde_json::to_string(&data)?);
     } else {
         println!("Stats: {}", data["stats"]);
+        println!("Priority: {}", data["priority"]);
         for (name, pool) in pools {
             println!(
                 "Pool {name}: {} slots; budget {}",
@@ -451,10 +463,11 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
             );
             for h in pool["holders"].as_array().unwrap() {
                 println!(
-                    "  {} {} campaign={} purpose={} task={} pane={} cwd={} seq={} admitted={} lease_expires={} cost={} anon={} ports={}-{} notify={}",
+                    "  {} {} campaign={} level={} purpose={} task={} pane={} cwd={} seq={} admitted={} lease_expires={} cost={} anon={} ports={}-{} notify={}",
                     h["run"],
                     h["state"],
                     h["campaign"],
+                    h["level"],
                     h["purpose"],
                     h["task"],
                     h["pane"],
@@ -471,9 +484,10 @@ pub fn status(cfg: &Config, as_json: bool) -> Result<()> {
             }
             for q in pool["queue"].as_array().unwrap() {
                 println!(
-                    "  queue #{} campaign={} purpose={} cost={} since={} reason={} holder_pid={}",
+                    "  queue #{} campaign={} level={} purpose={} cost={} since={} reason={} holder_pid={}",
                     q["position"],
                     q["campaign"],
+                    q["level"],
                     q["purpose"],
                     q["cost_mib"],
                     q["since"],

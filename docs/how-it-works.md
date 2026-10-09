@@ -31,9 +31,10 @@ PSI full avg60 <= psi_full_avg60_max
 
 ## Queue order and campaign caps
 
-Within each pool, the effective head is the oldest live ticket that is not
-blocked by the campaign cap. A capped ticket keeps its enqueue time and
-position and reports `campaign_cap`; only another campaign may pass it.
+Within each pool, the effective head has the highest level among tickets
+not blocked by the campaign cap. Equal levels stay FIFO by enqueue sequence.
+The campaign cap still beats priority. A capped ticket keeps its enqueue time
+and reports `campaign_cap`; only another campaign may pass it.
 Tickets blocked by memory, PSI, load, slots, ports, locks, or recovery are
 never passed over.
 
@@ -50,11 +51,24 @@ stop-side rule applies even when no other campaign waits.
 A queued ticket refreshes its heartbeat every poll. A stale head (five
 seconds plus three polls) earns no stop, even while its flock is still held.
 
+In a memory-gated pool, `priority_wait` holds a waiter while a strictly higher
+level waiter can be admitted right now. That higher waiter must be live,
+head of its memory-gated pool, and pass slots, memory, PSI, load, recovery,
+ports, and its legacy lock. A higher waiter that cannot be admitted holds
+nobody. Equal levels do not hold each other across pools.
+
+A campaign name is a claim. Callers can name any campaign; priority does not
+authenticate them. A hub can also assign levels by task ID in the optional
+priority file. There is no starvation guard; the writer lifts priority.
+
 ## Leases, yield, and idle release
 
 - A campaign may use spare slots when no eligible other campaign waits. Its
   newest holders beyond the cap yield when contention appears.
 - An overdue lease continues when nobody waits.
+- A lower-level holder may yield to its pool's higher-level head with reason
+  `priority_yield`. Equal levels and same-campaign waiters never earn this
+  reason. Existing waiter age, warning grace, and one-stop claims still apply.
 - Under contention only the oldest eligible holder whose release admits the
   head waiter earns a stop. A durable ticket claim permits one stop per
   waiter. Its holder stays the candidate through grace while eligible, even
@@ -79,7 +93,8 @@ seconds plus three polls) earns no stop, even while its flock is still held.
 
 ## Memory pressure
 
-On pressure the newest evictable holder stops itself. A stop records live
+On pressure the lowest-level evictable started holder stops itself. Within
+that level, the newest admission goes first. A stop records live
 stats, holder costs and anonymous memory, and optional lock observations.
 After a stop, memory-gated admission waits for the recovery interval
 (`recovery_healthy_seconds`). Pools without the memory gate ignore pressure

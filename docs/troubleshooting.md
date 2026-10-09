@@ -55,6 +55,9 @@ hook, when one is configured, can send a note, and `events.jsonl` (under
 `${XDG_STATE_HOME:-~/.local/state}/slotr/`) normally records the reason.
 slotr does not restart it. Queue it again with the original `slotr run`
 command when the work still needs it.
+Stderr prints `slotr: stopped RUN: REASON`. `priority_yield` means a
+higher-level head in the same pool earned a yield through warning and grace.
+Check configured priority or the file before requeueing.
 
 **`no systemd user bus here; run it in a terminal with a systemd user session`.**
 `run` and `stop` need a reachable systemd user bus. Sandboxed agent shells
@@ -91,6 +94,11 @@ shows each waiter's reason. The reasons are `fifo` (another ticket is ahead),
 `legacy_lock` (with the holder's pid when known), and `recovery` (waiting
 after a stop). `slotr status` alone also shows `ready`: the waiter is first
 and the admission checks pass right now. See [how-it-works.md](how-it-works.md).
+
+`priority_wait` means a strictly higher-level live head in a memory-gated
+pool can be admitted now. The hold ends after that run admits, becomes stale,
+or fails any admission check. A higher waiter blocked by memory, ports, slots,
+cap, or its legacy lock holds nobody.
 
 ## Config
 

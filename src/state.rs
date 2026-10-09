@@ -13,6 +13,8 @@ pub struct Request {
     pub enqueue_seq: u64,
     pub pool: String,
     pub campaign: String,
+    #[serde(default)]
+    pub level: u32,
     pub purpose: String,
     #[serde(default)]
     pub task: String,
