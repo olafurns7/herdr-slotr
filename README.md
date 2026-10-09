@@ -4,8 +4,9 @@ slotr is a queue for heavy commands on one Linux machine, such as dev
 servers and test stacks. `slotr run` waits for a free slot and enough free
 memory, then runs your command in its own
 [systemd user service](docs/install.md#requirements). When memory runs low,
-slotr can stop the newest evictable command, and it can reclaim a run past
-its lease when another campaign waits. This lowers the risk of running out
+slotr can stop the lowest-priority evictable command, newest first within a
+priority level, and it can reclaim a run past its lease when another
+campaign waits. This lowers the risk of running out
 of memory but does not remove it.
 
 ## Quick install

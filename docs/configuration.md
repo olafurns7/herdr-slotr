@@ -8,7 +8,8 @@ slotr reads `${XDG_CONFIG_HOME:-~/.config}/slotr/config.toml`, or the path in
 `SLOTR_CONFIG`. A missing config uses the built-in defaults below.
 `config.example.toml` in this repository is the built-in default
 configuration; copy it to start your own. `examples/devbox.toml` is a larger
-example with a `runtime` pool, ports, a legacy lock, and hooks.
+example with a `runtime` pool, a `heavy` pool for one-shot commands, ports,
+legacy locks, and hooks.
 
 ## Check and show
 

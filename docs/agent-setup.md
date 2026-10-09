@@ -35,16 +35,24 @@ slotr run --pool runtime --campaign <campaign> --purpose "<what for>" \
   --task <lead task id> --pane <lead pane> -- <command>
 ```
 
-- Exit 75 means slotr stopped the runtime (pressure, lease, or yield). A
-  configured `on_stop` hook can send a note, and `events.jsonl` normally
-  records the reason. Queue again when the work still needs it.
+- Exit 75 with a `slotr: stopped RUN: REASON` line on stderr means slotr
+  stopped the runtime (pressure, lease, or yield). A configured `on_stop`
+  hook can send a note, and `events.jsonl` normally records the reason.
+  Queue again when the work still needs it.
 - `slotr status` shows holders, the queue, and each waiter's wait reason.
 - A lead may wait for admission with
   `herdr pane wait-output <pane> --match 'slotr: admitted'`.
 - `slotr run` needs a systemd user bus, so it runs in a Herdr pane, not in a
   sandboxed agent tool shell.
-- Heavy checks stay on the host's heavy-command lock; slotr is for runtimes
-  that stay up.
+- Heavy one-shot commands (type checks, lint, tests, builds, installs) go
+  through the host's heavy pool when it has one:
+  `slotr run --pool heavy --kind tsc --campaign <campaign> --purpose "<what for>" -- <command>`.
+  See [usage.md](usage.md#heavy-one-shot-commands).
+- Caller contract for exit 75 with `slotr: stopped RUN: REASON` on stderr:
+  slotr stopped the command, and the result says nothing about the code.
+  Re-run it, at most three attempts in all, and report it as "stopped by
+  slotr", never as a failed check. Exit 75 without that line is the
+  command's own result.
 
 `examples/devbox.toml` shows a `runtime` pool with hooks that send task notes
 through `taskr`; see [configuration.md](configuration.md#hooks).
