@@ -70,6 +70,8 @@ pub struct Lease {
     pub waiter_min_wait_seconds: f64,
     pub idle_release_minutes: f64,
     pub idle_cpu_ms_per_min: f64,
+    pub holder_probe: Vec<String>,
+    pub holder_idle_minutes: f64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Hooks {

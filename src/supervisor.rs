@@ -6,6 +6,7 @@ use crate::{
     stats,
 };
 use anyhow::{Result, ensure};
+use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -20,6 +21,93 @@ struct Action {
     warn: Option<(Holder, String)>,
     stop: Option<(Holder, String, State)>,
     cancelled: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HolderActivity {
+    Idle,
+    Active,
+    Unknown,
+}
+fn holder_activity(cfg: &Config, pane: &str) -> HolderActivity {
+    if cfg.lease.holder_probe.is_empty() || pane.is_empty() {
+        return HolderActivity::Unknown;
+    }
+    let probe = || -> Result<HolderActivity> {
+        #[derive(Deserialize)]
+        struct Listing {
+            result: Agents,
+        }
+        #[derive(Deserialize)]
+        struct Agents {
+            agents: Vec<Agent>,
+        }
+        #[derive(Deserialize)]
+        struct Agent {
+            pane_id: String,
+            agent_status: String,
+        }
+        let output = manager::capture(
+            Command::new(&cfg.lease.holder_probe[0])
+                .args(&cfg.lease.holder_probe[1..])
+                .process_group(0),
+            Duration::from_secs(5),
+            true,
+        )?;
+        ensure!(output.status.success(), "holder probe failed");
+        let listing: Listing = serde_json::from_slice(&output.stdout)?;
+        let matches: Vec<_> = listing
+            .result
+            .agents
+            .iter()
+            .filter(|a| a.pane_id == pane)
+            .collect();
+        Ok(match matches.as_slice() {
+            [] => HolderActivity::Idle,
+            [agent] => match agent.agent_status.as_str() {
+                "idle" | "done" => HolderActivity::Idle,
+                "working" | "blocked" | "waiting" | "starting" => HolderActivity::Active,
+                _ => HolderActivity::Unknown,
+            },
+            _ => HolderActivity::Unknown,
+        })
+    };
+    probe().unwrap_or(HolderActivity::Unknown)
+}
+fn update_holder_activity(holder: &mut Holder, activity: HolderActivity, now: f64) {
+    match activity {
+        HolderActivity::Idle => {
+            holder.holder_idle_since.get_or_insert(now);
+        }
+        HolderActivity::Active | HolderActivity::Unknown => holder.holder_idle_since = None,
+    }
+}
+fn holder_idle(holder: &Holder, cfg: &Config, now: f64) -> bool {
+    !cfg.lease.holder_probe.is_empty()
+        && !holder.request.pane.is_empty()
+        && holder
+            .holder_idle_since
+            .is_some_and(|t| now - t >= cfg.lease.holder_idle_minutes * 60.0)
+}
+fn touch_holder(s: &mut State, run: &str, now: f64) -> Result<()> {
+    let holder = s
+        .holders
+        .iter_mut()
+        .find(|h| h.run == run)
+        .ok_or_else(|| anyhow::anyhow!("unknown run: {run}"))?;
+    ensure!(
+        holder.started && holder.stopping_at.is_none(),
+        "run is not running: {run}"
+    );
+    holder.holder_idle_since = holder.holder_idle_since.map(|_| now);
+    holder.idle_since = None;
+    holder.cpu_usage_usec = None;
+    holder.cpu_sample_at = None;
+    Ok(())
+}
+pub fn touch(run: &str) -> Result<()> {
+    state::transaction(|s| touch_holder(s, run, manager::now()))?;
+    let _ = manager::event(json!({"event":"touch", "run":run}));
+    Ok(())
 }
 fn lease_action(
     s: &mut State,
@@ -44,6 +132,7 @@ fn lease_action(
             && holder.stopping_at.is_none()
             && (admission::overdue(holder, now)
                 || admission::yielding(holder, s, pool)
+                || holder_idle(holder, cfg, now)
                 || (cfg.lease.idle_release_minutes > 0.0
                     && holder
                         .idle_since
@@ -106,6 +195,8 @@ fn lease_action(
                 "campaign_yield"
             } else if admission::overdue(&h, now) {
                 "lease_expired"
+            } else if holder_idle(&h, cfg, now) {
+                "holder_idle"
             } else {
                 "idle_release"
             };
@@ -123,6 +214,8 @@ fn lease_action(
             "campaign_yield"
         } else if admission::overdue(&h, now) {
             "lease_expired"
+        } else if holder_idle(&h, cfg, now) {
+            "holder_idle"
         } else {
             "idle_release"
         };
@@ -142,6 +235,10 @@ fn lease_action(
         if action.warn.is_some() && !h.warned_waiters.contains(&q.enqueue_seq) {
             s.holders[index].warned_waiters.push(q.enqueue_seq);
         }
+    }
+    if head.is_none() && holder_idle(&h, cfg, now) && !h.holder_idle_warned {
+        s.holders[index].holder_idle_warned = true;
+        action.warn = Some((s.holders[index].clone(), "holder_idle".into()));
     }
     action
 }
@@ -191,6 +288,7 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
         let mut pressure_warned = false;
         let mut previous_error = None;
         let mut tick = Instant::now();
+        let mut last_probe = None;
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(manager::code(status));
@@ -205,6 +303,15 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
             }
             tick = Instant::now();
             let tick_result = (|| -> Result<Option<i32>> {
+                let activity = if !cfg.lease.holder_probe.is_empty()
+                    && last_probe.is_none_or(|at| manager::now() - at >= 60.0)
+                {
+                    let activity = holder_activity(cfg, &h.request.pane);
+                    last_probe = Some(manager::now());
+                    Some(activity)
+                } else {
+                    None
+                };
                 let sample = stats::read();
                 let now = manager::now();
                 memory_count = if sample
@@ -247,6 +354,13 @@ pub fn supervise(run: &str, cmd: &[String], cfg: &Config) -> Result<i32> {
                         s.enqueue_seq = s.enqueue_seq.max(h.request.enqueue_seq);
                         s.admit_seq = s.admit_seq.max(h.admit_seq);
                         s.holders.push(h.clone());
+                    }
+                    if let Some(activity) = activity {
+                        update_holder_activity(
+                            s.holders.iter_mut().find(|h| h.run == run).unwrap(),
+                            activity,
+                            now,
+                        );
                     }
                     admission::update_recovery(s, &sample, cfg, now);
                     let fitting_waiter = query_error.is_none()
@@ -416,6 +530,8 @@ fn warn_once_when_an_effective_head_returns() {
         idle_since: None,
         cpu_usage_usec: None,
         cpu_sample_at: None,
+        holder_idle_since: None,
+        holder_idle_warned: false,
     };
     let mut s = State {
         holders: vec![holder],
@@ -442,4 +558,303 @@ fn warn_once_when_an_effective_head_returns() {
             .warn
             .is_none()
     );
+}
+
+#[cfg(test)]
+mod holder_tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    struct Fixture {
+        cfg: Config,
+        state: State,
+        script: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let script = std::env::temp_dir().join(format!(
+                "slotr-probe-{}-{}.sh",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::write(&script, "printf '%s\\n' \"$1\"\nexit \"$2\"\n").unwrap();
+            let mut cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+            cfg.pools.get_mut("default").unwrap().memory_gated = false;
+            cfg.lease.grace_seconds = 5.0;
+            cfg.lease.waiter_min_wait_seconds = 0.0;
+            cfg.lease.holder_idle_minutes = 1.0;
+            cfg.lease.holder_probe = vec![
+                "sh".into(),
+                script.display().to_string(),
+                String::new(),
+                "0".into(),
+            ];
+            let holder: Holder = serde_json::from_value(json!({
+                "enqueue_seq":1, "pool":"default", "campaign":"holder", "purpose":"synthetic",
+                "pane":"test-pane", "cwd":"/tmp", "cost_mib":0, "lease_seconds":1000.0,
+                "since":0.0, "seen_at":0.0, "run":"slotr-default-1", "admit_seq":1,
+                "slot":0, "admitted_at":0.0, "lease_expires_at":1000.0, "started":true
+            }))
+            .unwrap();
+            Self {
+                cfg,
+                state: State {
+                    holders: vec![holder],
+                    ..State::default()
+                },
+                script,
+            }
+        }
+        fn probe(&mut self, agents: serde_json::Value, now: f64) -> HolderActivity {
+            self.cfg.lease.holder_probe[2] = json!({"result":{"agents":agents}}).to_string();
+            let activity = holder_activity(&self.cfg, "test-pane");
+            update_holder_activity(&mut self.state.holders[0], activity, now);
+            activity
+        }
+        fn status(&mut self, status: &str, now: f64) -> HolderActivity {
+            self.probe(json!([{"pane_id":"test-pane", "agent_status":status}]), now)
+        }
+        fn waiter(&mut self) {
+            let mut q = self.state.holders[0].request.clone();
+            q.enqueue_seq = 2;
+            q.campaign = "waiter".into();
+            self.state.queue.push(q);
+        }
+        fn action(&mut self, now: f64) -> Action {
+            for q in &mut self.state.queue {
+                q.seen_at = now;
+            }
+            lease_action(
+                &mut self.state,
+                "slotr-default-1",
+                &self.cfg,
+                &BTreeMap::new(),
+                &stats::Stats::default(),
+                now,
+            )
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_file(&self.script).unwrap();
+        }
+    }
+
+    #[test]
+    fn idle_and_gone_warn_then_stop_under_contention() {
+        for agents in [
+            json!([{"pane_id":"test-pane","agent_status":"idle"}]),
+            json!([]),
+        ] {
+            let mut f = Fixture::new();
+            assert_eq!(f.probe(agents.clone(), 0.0), HolderActivity::Idle);
+            f.waiter();
+            assert!(f.action(59.0).warn.is_none());
+            f.probe(agents, 60.0);
+            assert_eq!(f.action(60.0).warn.unwrap().1, "holder_idle");
+            assert!(f.action(64.0).stop.is_none());
+            assert_eq!(f.action(65.0).stop.unwrap().1, "holder_idle");
+        }
+    }
+
+    #[test]
+    fn uncontended_idle_warns_once_per_run_and_never_stops() {
+        let mut f = Fixture::new();
+        f.status("done", 0.0);
+        assert_eq!(f.action(60.0).warn.unwrap().1, "holder_idle");
+        assert!(f.action(65.0).stop.is_none());
+        assert!(f.action(120.0).warn.is_none());
+        f.status("working", 121.0);
+        f.status("idle", 122.0);
+        assert!(f.action(200.0).warn.is_none());
+        f.waiter();
+        assert_eq!(f.action(201.0).warn.unwrap().1, "holder_idle");
+        assert_eq!(f.action(206.0).stop.unwrap().1, "holder_idle");
+    }
+
+    #[test]
+    fn working_and_failed_probe_clear_the_idle_clock_and_cancel_reclaim() {
+        for failed in [false, true] {
+            let mut f = Fixture::new();
+            f.status("idle", 0.0);
+            f.waiter();
+            assert!(f.action(60.0).warn.is_some());
+            if failed {
+                f.cfg.lease.holder_probe[3] = "1".into();
+            }
+            assert_eq!(
+                f.status("working", 65.0),
+                if failed {
+                    HolderActivity::Unknown
+                } else {
+                    HolderActivity::Active
+                }
+            );
+            assert!(f.state.holders[0].holder_idle_since.is_none());
+            let action = f.action(65.0);
+            assert!(action.stop.is_none());
+            assert!(action.warn.is_none());
+            assert!(action.cancelled.is_some());
+            assert!(f.state.queue[0].stop_claimed_by.is_none());
+            f.cfg.lease.holder_probe[3] = "0".into();
+            f.status("idle", 70.0);
+            assert!(f.action(129.0).warn.is_none());
+            assert!(f.action(130.0).warn.is_some());
+        }
+    }
+
+    #[test]
+    fn malformed_listing_missing_pane_and_unknown_status_never_act() {
+        let mut f = Fixture::new();
+        for agents in [
+            json!(null),
+            json!([{}]),
+            json!([{"pane_id":"test-pane","agent_status":"unexpected"}]),
+            json!([
+                {"pane_id":"test-pane","agent_status":"idle"}, {"pane_id":"test-pane","agent_status":"working"}
+            ]),
+        ] {
+            assert_eq!(f.probe(agents, 0.0), HolderActivity::Unknown);
+            assert!(f.action(120.0).warn.is_none());
+        }
+        f.cfg.lease.holder_probe[2] = "invalid json".into();
+        assert_eq!(
+            holder_activity(&f.cfg, "test-pane"),
+            HolderActivity::Unknown
+        );
+        assert_eq!(holder_activity(&f.cfg, ""), HolderActivity::Unknown);
+        f.cfg.lease.holder_probe.clear();
+        assert_eq!(
+            holder_activity(&f.cfg, "test-pane"),
+            HolderActivity::Unknown
+        );
+    }
+
+    #[test]
+    fn touch_resets_only_idle_clocks_and_grace_decides_cancellation() {
+        let mut f = Fixture::new();
+        f.status("idle", 0.0);
+        f.waiter();
+        assert!(f.action(60.0).warn.is_some());
+        f.state.holders[0].idle_since = Some(0.0);
+        f.state.holders[0].cpu_usage_usec = Some(42);
+        f.state.holders[0].cpu_sample_at = Some(0.0);
+        touch_holder(&mut f.state, "slotr-default-1", 64.0).unwrap();
+        let h = &f.state.holders[0];
+        assert_eq!(h.holder_idle_since, Some(64.0));
+        assert_eq!(h.lease_expires_at, Some(1000.0));
+        assert!(h.idle_since.is_none() && h.cpu_usage_usec.is_none() && h.cpu_sample_at.is_none());
+        assert_eq!(h.warned_at, Some(60.0));
+        assert_eq!(h.warned_for, Some(2));
+        assert_eq!(
+            f.state.queue[0].stop_claimed_by.as_deref(),
+            Some("slotr-default-1")
+        );
+        let action = f.action(65.0);
+        assert!(action.stop.is_none());
+        assert!(action.cancelled.is_some());
+        assert!(f.state.queue[0].stop_claimed_by.is_none());
+        assert!(f.action(123.0).warn.is_none());
+        assert!(f.action(124.0).warn.is_some());
+        f.state.holders[0].stopping_at = Some(125.0);
+        assert!(touch_holder(&mut f.state, "slotr-default-1", 126.0).is_err());
+        assert!(touch_holder(&mut f.state, "unknown", 126.0).is_err());
+        f.state.holders[0].stopping_at = None;
+        f.state.holders[0].request.lease_seconds = 0.0;
+        f.state.holders[0].lease_expires_at = None;
+        touch_holder(&mut f.state, "slotr-default-1", 127.0).unwrap();
+        assert!(f.state.holders[0].lease_expires_at.is_none());
+    }
+
+    #[test]
+    fn repeated_touch_cannot_extend_max_lease_under_contention() {
+        let mut f = Fixture::new();
+        f.cfg.pools.get_mut("default").unwrap().max_lease = "90m".into();
+        assert_eq!(f.cfg.pools["default"].slots, 1);
+        f.cfg.lease.holder_idle_minutes = 20.0;
+        f.cfg.lease.grace_seconds = 300.0;
+        f.state.holders[0].request.lease_seconds = 5400.0;
+        f.state.holders[0].lease_expires_at = Some(5400.0);
+        f.waiter();
+        let mut warnings = 0;
+        for step in 0..=95 {
+            let now = step as f64 * 60.0;
+            update_holder_activity(&mut f.state.holders[0], HolderActivity::Idle, now);
+            let action = f.action(now);
+            if let Some((_, reason, _)) = action.stop {
+                assert_eq!(now, 5400.0 + f.cfg.lease.grace_seconds);
+                assert_eq!(reason, "lease_expired");
+                assert!(warnings > 1);
+                return;
+            }
+            if action.warn.is_some() {
+                warnings += 1;
+                touch_holder(&mut f.state, "slotr-default-1", now + 60.0).unwrap();
+                assert_eq!(f.state.holders[0].lease_expires_at, Some(5400.0));
+                assert_eq!(f.state.holders[0].warned_at, Some(now));
+                assert_eq!(
+                    f.state.queue[0].stop_claimed_by.as_deref(),
+                    Some("slotr-default-1")
+                );
+            }
+        }
+        panic!("repeated touch defeated the lease ceiling");
+    }
+
+    #[test]
+    fn idle_holder_with_an_unfitting_waiter_preserves_contention_reason() {
+        let mut f = Fixture::new();
+        f.cfg.pools.get_mut("default").unwrap().memory_gated = true;
+        f.status("idle", 0.0);
+        f.waiter();
+        f.state.queue[0].seen_at = 60.0;
+        let sample = stats::Stats {
+            available_mib: Some(1000.0),
+            ..stats::Stats::default()
+        };
+        let action = lease_action(
+            &mut f.state,
+            "slotr-default-1",
+            &f.cfg,
+            &BTreeMap::new(),
+            &sample,
+            60.0,
+        );
+        assert_eq!(action.warn.unwrap().1, "overdue_stop_would_not_help");
+        assert!(action.stop.is_none());
+        assert!(!f.state.holders[0].holder_idle_warned);
+        assert!(f.state.queue[0].stop_claimed_by.is_none());
+    }
+
+    #[test]
+    fn probe_descendant_holding_stdout_cannot_delay_the_tick() {
+        let mut f = Fixture::new();
+        f.cfg.lease.holder_probe = vec!["sh".into(), "-c".into(),
+            "sleep 12 & printf '%s' '{\"result\":{\"agents\":[{\"pane_id\":\"test-pane\",\"agent_status\":\"working\"}]}}'".into()];
+        let start = Instant::now();
+        assert_eq!(holder_activity(&f.cfg, "test-pane"), HolderActivity::Active);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn off_and_non_evictable_pools_do_not_warn_or_stop() {
+        for policy_off in [true, false] {
+            let mut f = Fixture::new();
+            f.status("idle", 0.0);
+            if policy_off {
+                f.cfg.lease.on_expiry = "off".into();
+            } else {
+                f.cfg.pools.get_mut("default").unwrap().evictable = false;
+            }
+            assert!(f.action(60.0).warn.is_none());
+            f.waiter();
+            let action = f.action(65.0);
+            assert!(action.warn.is_none() && action.stop.is_none());
+        }
+    }
 }

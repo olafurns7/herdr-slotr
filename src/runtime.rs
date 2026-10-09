@@ -145,6 +145,8 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
                         idle_since: None,
                         cpu_usage_usec: None,
                         cpu_sample_at: None,
+                        holder_idle_since: None,
+                        holder_idle_warned: false,
                     };
                     s.holders.push(holder.clone());
                     s.queue.retain(|q| q.enqueue_seq != seq);

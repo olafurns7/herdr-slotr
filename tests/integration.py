@@ -1104,7 +1104,7 @@ class AdmissionTest(unittest.TestCase):
 
     def test_warn_claim_cleared_when_holder_exits_without_a_stop(self):
         self.configure_clock()
-        self.cfg["grace"] = 0.7
+        self.cfg["grace"] = 20
         self.write_config()
         self.set_stats(40000)
         first, p1 = self.start("first", lease="1s")
@@ -1113,11 +1113,14 @@ class AdmissionTest(unittest.TestCase):
         self.wait(p2.exists)
         _, waiter = self.start("waiter")
         self.wait(lambda: bool(self.status()["queue"]))
-        self.advance(10)
         self.wait(lambda: bool(self.events("warn")))
         self.set_stats(19000)
         first.terminate()
         first.wait(timeout=3)
+        self.assertEqual(first.returncode, 143)
+        self.assertEqual(self.events("stop"), [])
+        self.wait(lambda: any(e['run'].endswith('-2') for e in self.events('warn')))
+        self.advance(21)
         self.wait(lambda: second.poll() is not None)
         self.assertEqual(second.returncode, 75)
         self.wait(waiter.exists)
@@ -1215,11 +1218,15 @@ class AdmissionTest(unittest.TestCase):
         self.advance(10)
         self.wait(lambda: bool(self.events('warn')))
         self.set_stats(10000)                         # at grace end the stop would not admit the waiter
-        self.advance(25)
+        for _ in range(13):
+            self.advance(2)
+            self.pause(0.2)
         self.wait(lambda: bool(self.events('warn_cancelled')))
         self.set_stats(40000)                         # the holder claims the same ticket again
         self.wait(lambda: any(h.get('state') == 'warned' for h in self.status()['slots']))
-        self.advance(25)
+        for _ in range(13):
+            self.advance(2)
+            self.pause(0.2)
         self.wait(lambda: old.poll() is not None)
         log = [json.loads(l) for l in (self.root / 'state/slotr/events.jsonl').read_text().splitlines()]
         order = [e['event'] for e in log if e['event'] in ('warn', 'warn_cancelled', 'stop')]
@@ -1435,6 +1442,79 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual([e['run'] for e in self.events('warn')], [claimed_run])
         self.assertEqual([e['run'] for e in self.events('stop')], [claimed_run])
         self.assertEqual(self.events('warn_cancelled'), [])
+
+
+    def test_holder_probe_touch_and_contention_with_fake_herdr(self):
+        self.configure_clock()
+        self.cfg['runtime_slots'] = 1
+        self.cfg['campaign_cap'] = 0
+        self.cfg['grace'] = 30
+        self.write_config()
+        self.set_stats(40000)
+        self.env.update(HOME=str(self.root), TASKR_DB=str(self.root / 'taskr.db'),
+                        SLOTR_LEASE__HOLDER_PROBE='["herdr", "agent", "list"]',
+                        SLOTR_LEASE__HOLDER_IDLE_MINUTES='1.0')
+        listing = self.root / 'agents.json'
+        listing.write_text(json.dumps({'result': {'agents': [{'pane_id': 'holder-pane', 'agent_status': 'idle'}]}}))
+        herdr = self.bin / 'herdr'
+        herdr.write_text('#!' + sys.executable + '\n' +
+                        "import json, os, pathlib, sys\n" +
+                        "root = pathlib.Path(os.environ['HOME'])\n" +
+                        "assert sys.argv[1:] == ['agent', 'list']\n" +
+                        "with (root / 'probe-calls').open('a') as f: f.write('probe\\n')\n" +
+                        "print((root / 'agents.json').read_text())\n")
+        herdr.chmod(0o755)
+        holder, output = self.start('holder', pane='holder-pane')
+        h = self.admitted('holder', output)
+        def raw_holder():
+            return json.loads((self.runtime / 'slotr/state.json').read_text())['holders'][0]
+        self.wait(lambda: raw_holder().get('holder_idle_since') is not None)
+        self.pause(0.3)
+        self.assertEqual((self.root / 'probe-calls').read_text().count('probe'), 1)
+        self.advance(61)
+        self.wait(lambda: bool(self.events('warn')))
+        self.assertEqual([e['reason'] for e in self.events('warn')], ['holder_idle'])
+        self.assertTrue(self.status()['slots'][0]['holder_idle_since'].endswith('Z'))
+        self.advance(61)
+        self.wait(lambda: (self.root / 'probe-calls').read_text().count('probe') >= 3)
+        self.assertEqual(len(self.events('warn')), 1)
+        self.assertIsNone(holder.poll())
+        _, waiter = self.start('waiter', pane='waiter-pane')
+        self.wait(lambda: raw_holder().get('warned_for') is not None)
+        warned = raw_holder()
+        result = self.invoke('touch', h['run'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        touched = raw_holder()
+        self.assertEqual(touched['warned_for'], warned['warned_for'])
+        self.assertEqual(touched['warned_at'], warned['warned_at'])
+        self.assertIsNone(touched['idle_since'])
+        self.assertEqual(touched['lease_expires_at'], warned['lease_expires_at'])
+        self.assertEqual([e['run'] for e in self.events('touch')], [h['run']])
+        self.advance(30)
+        self.wait(lambda: bool(self.events('warn_cancelled')))
+        self.assertIsNone(raw_holder()['warned_for'])
+        self.assertIsNone(holder.poll())
+        self.assertEqual(len(self.events('warn')), 2)
+        self.advance(31)
+        self.wait(lambda: len(self.events('warn')) == 3)
+        self.assertEqual(self.events('warn')[-1]['reason'], 'holder_idle')
+        self.advance(31)
+        self.wait(lambda: holder.poll() is not None)
+        self.wait(waiter.exists)
+        self.assertEqual(holder.returncode, 75)
+        self.assertEqual([e['reason'] for e in self.events('stop')], ['holder_idle'])
+        self.assertEqual(self.invoke('touch', 'unknown-run').returncode, 2)
+
+    def test_touch_succeeds_when_event_append_fails(self):
+        self.env.update(HOME=str(self.root), TASKR_DB=str(self.root / 'taskr.db'))
+        _, output = self.start('holder')
+        h = self.admitted('holder', output)
+        events = self.root / 'state/slotr/events.jsonl'
+        self.wait(events.exists)
+        events.unlink()
+        events.mkdir()
+        result = self.invoke('touch', h['run'])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=True)

@@ -68,6 +68,13 @@ seconds plus three polls) earns no stop, even while its flock is still held.
   warns once for that waiter. `on_expiry = "warn"` never stops it.
 - Idle release uses cgroup `cpu.stat` and applies only while a fitting
   waiter exists.
+- The optional holder probe samples the run's pane every 60 seconds. An idle,
+  done, or gone holder earns one warning without contention, and follows the
+  same grace and stop path with contention. Probe errors clear its idle clock.
+  Any working sample during grace resets that clock and cancels an idle-only
+  warning at grace end. `slotr touch RUN` resets both idle clocks; it never
+  renews the lease or clears a warning or stop claim. Holder-idle protection
+  requires `holder_idle_minutes * 60 > grace_seconds`.
 - Pools with `evictable = false` never stop automatically.
 
 ## Memory pressure

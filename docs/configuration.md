@@ -103,6 +103,28 @@ enabled. A legacy lock requires a path; its mode defaults to `shared`.
 | `waiter_min_wait_seconds` | `300.0` | Minimum head-waiter age before a warning |
 | `idle_release_minutes` | `0.0` | Idle release interval; 0 disables |
 | `idle_cpu_ms_per_min` | `100.0` | cgroup CPU usage rate below which a holder is idle |
+| `holder_probe` | `[]` | argv listing holder agents; empty disables probing; fleet example `["herdr", "agent", "list"]` |
+| `holder_idle_minutes` | `20.0` | Continuous observed holder inactivity before warning or contention reclaim |
+
+When enabled, each supervisor probes every 60 seconds, outside the state lock,
+with a 5-second timeout. It matches the run's `--pane` against
+`result.agents[].pane_id` and reads `agent_status`. `idle`, `done`, or absence
+from a successful listing counts as inactivity. Working agents reset the
+clock. Failed or malformed probes are unknown and clear the clock, so they
+cannot trigger holder reclaim. A run without `--pane` is unknown.
+
+An inactive holder gets reason `holder_idle`. Without a waiter, it gets one
+`on_warn` per run and continues running. Under contention it follows the
+existing warning, `grace_seconds`, and exit-75 stop path. `on_expiry = "off"`
+and non-evictable pools disable these actions. Any working sample during the
+grace clears the holder-idle clock and cancels an idle-only warning when the
+grace check runs. Use `slotr touch RUN` before grace expires to reset the idle
+clocks; it never renews the lease or clears a pending warning or stop claim.
+The grace check decides whether reclaim is still eligible. Touch defends
+against idle reclaim only: overdue leases and campaign yield can still stop.
+For holder-idle protection, keep `holder_idle_minutes * 60 > grace_seconds`.
+The warning hook text should name both actions: `slotr touch {run}` to keep
+an in-use stack against idle reclaim, or `slotr stop {run}` to release it.
 
 ### Hooks
 

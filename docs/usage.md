@@ -9,6 +9,7 @@ slotr run --pool default --campaign docs --purpose "local preview" -- npm run de
 slotr status
 slotr status --json
 slotr stop slotr-default-1
+slotr touch slotr-default-1
 slotr config show
 slotr config check examples/devbox.toml
 slotr --version
@@ -22,10 +23,16 @@ slotr --version
   process.
 - `stop RUN` targets only a registered run and uses systemd to stop the
   complete unit.
+- `touch RUN` resets a running holder's inactivity and CPU-idle clocks,
+  defending against idle reclaim only. It never renews the lease or clears
+  a pending warning or stop claim; eligibility is checked at grace end.
+  Overdue leases, pressure and campaign yield still apply. It cannot revive
+  a run already stopping. A `touch` event is appended to `events.jsonl` when
+  event logging is available.
 - `config show` and `config check` are described in
   [configuration.md](configuration.md).
 
-`status` and `config` are portable. `run`, `stop`, and the internal
+`status` and `config` are portable. `run`, `stop`, `touch`, and the internal
 `_supervise` command need Linux and a systemd user bus; see
 [install.md](install.md#requirements).
 
@@ -40,8 +47,10 @@ slotr --version
 - `--lease 30m` requests a shorter lease; the pool's `max_lease` caps it.
   Duration suffixes are `s`, `m`, `h`, and `d`; a bare number is seconds and
   `"0"` means unlimited.
-- `--task ID` and `--pane PANE` are opaque strings used only in hook
-  substitutions.
+- `--task ID` is an opaque string used in hook substitutions. `--pane PANE`
+  also identifies the holder for the optional liveness probe. Pass the pane
+  ID (`--pane "$HERDR_PANE_ID"`) on the same Herdr server, not an agent name.
+  Moving a pane changes its ID; the original ID then reads as gone.
 - The command follows `--`. Commands and their arguments keep their literal
   argv boundaries; slotr itself never invokes a shell.
 
@@ -63,7 +72,7 @@ location, then have the lead start:
 
 ```sh
 slotr run --pool runtime --campaign my-feature --purpose "UI smoke" \
-  --task 123 --pane w1:p1 -- sh -c \
+  --task 123 --pane "$HERDR_PANE_ID" -- sh -c \
   'PORT=$((SLOTR_PORT_BASE+0)) ./start-dev.sh'
 ```
 

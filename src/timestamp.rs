@@ -64,6 +64,7 @@ pub fn display(value: &mut serde_json::Value) -> anyhow::Result<()> {
             "warned_at",
             "stopping_at",
             "idle_since",
+            "holder_idle_since",
             "cpu_sample_at",
             "at",
         ] {

@@ -118,6 +118,8 @@ pub fn capture(command: &mut Command, timeout: Duration, read_output: bool) -> R
         }
         thread::sleep(Duration::from_millis(10));
     };
+    // Descendants must close inherited pipes before the reader joins.
+    let _ = kill_group(&child, Signal::KILL);
     Ok(Output {
         status,
         stdout: out

@@ -41,6 +41,8 @@ grace_seconds = 300.0
 waiter_min_wait_seconds = 300.0
 idle_release_minutes = 0.0 # 0 disables idle release
 idle_cpu_ms_per_min = 100.0
+holder_probe = [] # argv; empty disables holder liveness checks
+holder_idle_minutes = 20.0
 
 [hooks]
 on_admit = [] # argv arrays, never interpreted by a shell
