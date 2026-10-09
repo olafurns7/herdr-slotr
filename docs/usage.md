@@ -109,6 +109,9 @@ slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
 
 Run at most three attempts:
 
+This example retries every exit 75, including a workload's own. Check each
+attempt's stop line before reporting it as stopped by slotr.
+
 ```sh
 n=1
 while :; do
@@ -118,7 +121,7 @@ while :; do
   if [ "$rc" -ne 75 ] || [ "$n" -ge 3 ]; then break; fi
   n=$((n + 1))
 done
-# $rc is the result; 75 here means slotr stopped all three attempts.
+# $rc is the result; classify 75 as stopped only with the stop line.
 ```
 
 Never retry without a cap. Under sustained pressure an uncapped loop is
