@@ -104,17 +104,17 @@ slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
   A script reads the result as it would without slotr.
 - Exit 75 with a `slotr: stopped RUN: REASON` line on stderr means slotr
   stopped the command. It is not a failure of the check. Run it again.
-- Installs and builds are stopped like any other kind. A re-run repairs an
-  install and overwrites build outputs.
+- Installs and builds are stopped like any other kind. Re-run them after a
+  slotr stop; follow the tool's recovery steps if it left partial outputs.
 
-Retry at most three times:
+Run at most three attempts:
 
 ```sh
 n=1
 while :; do
+  rc=0
   slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
-    -- pnpm tsc --noEmit
-  rc=$?
+    -- pnpm tsc --noEmit || rc=$?
   if [ "$rc" -ne 75 ] || [ "$n" -ge 3 ]; then break; fi
   n=$((n + 1))
 done
@@ -130,4 +130,5 @@ restarted and stopped again every recovery window.
 - A signal returns 128 + the signal number.
 - 2 means a CLI, config, platform, or manager failure.
 - 75 means slotr stopped the workload automatically (pressure, lease, yield,
-  or idle release).
+  or idle release) when stderr also has the `slotr: stopped RUN: REASON`
+  line. A workload's own exit 75 is relayed like any other code.

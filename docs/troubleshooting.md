@@ -60,8 +60,9 @@ higher-level head in the same pool earned a yield through warning and grace.
 Check configured priority or the file before requeueing.
 
 **Exit 75 from a check.** A heavy check, build, or install run through a
-heavy pool was stopped by slotr; the stderr line gives the reason. The check
-did not fail. Run it again, at most three attempts in all (see
+heavy pool exited 75 and stderr has `slotr: stopped RUN: REASON`: slotr
+stopped it, and the line gives the reason. The check did not fail. Run it
+again, at most three attempts in all (see
 [usage.md](usage.md#heavy-one-shot-commands)). If every attempt is stopped,
 the host is under sustained pressure or the lease is too short for the
 command: check `slotr status` and `events.jsonl` before trying later.
