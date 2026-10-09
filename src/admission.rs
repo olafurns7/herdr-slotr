@@ -75,20 +75,22 @@ pub fn priority_wait(
 ) -> bool {
     cfg.pools[&q.pool].memory_gated
         && s.queue.iter().any(|higher| {
-            let pool = &cfg.pools[&higher.pool];
             higher.level > q.level
-                && now - higher.seen_at <= 5.0 + 3.0 * cfg.admission.queue_poll_ms as f64 / 1000.0
-                && pool.memory_gated
-                && head(s, &higher.pool, cfg)
-                    .is_some_and(|first| first.enqueue_seq == higher.enqueue_seq)
-                && decide(s, higher, cfg, obs, sample, now, |slot| {
-                    pool.ports.as_ref().is_none_or(|p| {
-                        crate::manager::ports_free(p.base + slot * p.stride, p.probe)
-                    })
+                && cfg.pools.get(&higher.pool).is_some_and(|pool| {
+                    pool.memory_gated
+                        && now - higher.seen_at
+                            <= 5.0 + 3.0 * cfg.admission.queue_poll_ms as f64 / 1000.0
+                        && head(s, &higher.pool, cfg)
+                            .is_some_and(|first| first.enqueue_seq == higher.enqueue_seq)
+                        && decide(s, higher, cfg, obs, sample, now, |slot| {
+                            pool.ports.as_ref().is_none_or(|p| {
+                                crate::manager::ports_free(p.base + slot * p.stride, p.probe)
+                            })
+                        })
+                        .0
+                        .is_some()
+                        && crate::manager::legacy_free(pool)
                 })
-                .0
-                .is_some()
-                && crate::manager::legacy_free(pool)
         })
 }
 pub fn decide(

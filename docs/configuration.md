@@ -92,6 +92,8 @@ Levels are unsigned 32-bit integers. A run gets the highest matching level
 from the static list and file. No match means level 0. Task IDs match exactly.
 Blank lines and `#` comments are ignored. Malformed or truncated lines are
 skipped; other lines still apply. A missing or unreadable file adds no levels.
+A file over 64 KiB, or anything that is not a regular file, counts as missing.
+Keep the priority file on a local filesystem: nonblocking open does not bound slow regular-file I/O or a hung network mount.
 There is no age limit. Waiters refresh each poll; holders refresh each watchdog
 tick. Status shows stored levels and the current file state.
 

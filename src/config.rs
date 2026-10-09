@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 use toml::Value;
@@ -22,6 +23,29 @@ pub struct Priority {
     pub file: String,
 }
 impl Priority {
+    fn read(&self) -> Option<Vec<u8>> {
+        // Open nonblocking and check the handle so a FIFO replacement cannot stall a tick.
+        #[cfg(unix)]
+        let file = fs::File::from(
+            rustix::fs::open(
+                self.path(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .ok()?,
+        );
+        #[cfg(not(unix))]
+        let file = fs::File::open(self.path()).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.len() > 64 * 1024 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= 64 * 1024).then_some(bytes)
+    }
     fn path(&self) -> PathBuf {
         if self.file == "~" {
             PathBuf::from(env::var_os("HOME").unwrap_or_default())
@@ -39,7 +63,7 @@ impl Priority {
         };
         let mut level = u32::from(self.campaigns.iter().any(|p| matches(p)));
         if !self.file.is_empty()
-            && let Ok(bytes) = fs::read(self.path())
+            && let Some(bytes) = self.read()
         {
             for line in bytes
                 .split(|b| *b == b'\n')
@@ -67,7 +91,7 @@ impl Priority {
             serde_json::json!({"state":"off"})
         } else {
             let path = self.path();
-            if fs::read(&path).is_ok() {
+            if self.read().is_some() {
                 let age = fs::metadata(path)
                     .ok()
                     .and_then(|m| m.modified().ok())
