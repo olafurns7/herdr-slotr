@@ -43,8 +43,13 @@ slotr run --pool runtime --campaign <campaign> --purpose "<what for>" \
   `herdr pane wait-output <pane> --match 'slotr: admitted'`.
 - `slotr run` needs a systemd user bus, so it runs in a Herdr pane, not in a
   sandboxed agent tool shell.
-- Heavy checks stay on the host's heavy-command lock; slotr is for runtimes
-  that stay up.
+- Heavy one-shot commands (type checks, lint, tests, builds, installs) go
+  through the host's heavy pool when it has one:
+  `slotr run --pool heavy --kind tsc --campaign <campaign> --purpose "<what for>" -- <command>`.
+  See [usage.md](usage.md#heavy-one-shot-commands).
+- Caller contract for exit 75: slotr stopped the command, and the result says
+  nothing about the code. Re-run it, at most three attempts in all, and report
+  75 as "stopped by slotr", never as a failed check.
 
 `examples/devbox.toml` shows a `runtime` pool with hooks that send task notes
 through `taskr`; see [configuration.md](configuration.md#hooks).

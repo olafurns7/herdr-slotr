@@ -59,6 +59,18 @@ Stderr prints `slotr: stopped RUN: REASON`. `priority_yield` means a
 higher-level head in the same pool earned a yield through warning and grace.
 Check configured priority or the file before requeueing.
 
+**Exit 75 from a check.** A heavy check, build, or install run through a
+heavy pool was stopped by slotr; the stderr line gives the reason. The check
+did not fail. Run it again, at most three attempts in all (see
+[usage.md](usage.md#heavy-one-shot-commands)). If every attempt is stopped,
+the host is under sustained pressure or the lease is too short for the
+command: check `slotr status` and `events.jsonl` before trying later.
+
+**`waiting: legacy_lock` in a heavy pool.** An old caller holds the pool's
+legacy lock with plain `flock`, outside slotr. The waiter is admitted when
+that command ends. The pid is shown when known. Move that caller to
+`slotr run`; see [how-it-works.md](how-it-works.md#a-heavy-pool).
+
 **`no systemd user bus here; run it in a terminal with a systemd user session`.**
 `run` and `stop` need a reachable systemd user bus. Sandboxed agent shells
 and some remote shells have none. Start the command from a terminal in your

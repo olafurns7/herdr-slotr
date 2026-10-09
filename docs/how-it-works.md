@@ -103,6 +103,30 @@ recovery.
 An automatic stop sends TERM, waits `term_grace_seconds`, then KILL; systemd
 `TimeoutStopSec` adds 5 seconds. The run exits with code 75.
 
+## A heavy pool
+
+A pool for heavy one-shot commands (type checks, lint, tests, builds,
+installs) works like any other pool. The memory budget is shared across
+pools: a heavy check and a runtime count against the same available memory.
+With priority configured, a non-priority check queues behind a priority
+waiter that can be admitted now, and under pressure it is stopped before a
+priority holder.
+
+The yield path uses the global lease timings (`waiter_min_wait_seconds` and
+`grace_seconds`). They are sized for long runtimes, so a check that finishes
+in a few minutes never reaches a `priority_yield`. For short checks priority
+acts through queue order and pressure order only. A priority check can still
+wait behind two long builds that hold both slots.
+
+A shared legacy lock lets old `flock LOCK CMD` callers keep working during a
+transition. An old exclusive caller waits for the slotr holders to leave,
+then excludes every slotr waiter, which reports `legacy_lock`. This has two
+costs. An old caller ignores priority, so a non-priority `flock` command
+blocks a priority slotr run for its whole length. And `flock` has no
+fairness, so steady overlapping shared holders can keep an exclusive caller
+waiting a long time. Move callers to `slotr run` together, and read the
+`legacy_lock` wait reasons in status during the transition.
+
 ## Units
 
 Each admitted command runs in a transient systemd user service with its own

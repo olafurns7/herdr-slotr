@@ -88,6 +88,42 @@ slotr run --pool runtime --campaign my-feature --purpose "UI smoke" \
 
 Port probes are not reservations: applications must use strict port binding.
 
+## Heavy one-shot commands
+
+Type checks, lint, tests, builds, and installs can run through a heavy pool,
+such as the `heavy` pool in `examples/devbox.toml`. They then queue by memory
+and priority, and the watchdog can stop a low-priority check before a
+priority runtime.
+
+```sh
+slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
+  -- pnpm tsc --noEmit
+```
+
+- Output and the exit code pass through, and the working directory is kept.
+  A script reads the result as it would without slotr.
+- Exit 75 with a `slotr: stopped RUN: REASON` line on stderr means slotr
+  stopped the command. It is not a failure of the check. Run it again.
+- Installs and builds are stopped like any other kind. A re-run repairs an
+  install and overwrites build outputs.
+
+Retry at most three times:
+
+```sh
+n=1
+while :; do
+  slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
+    -- pnpm tsc --noEmit
+  rc=$?
+  if [ "$rc" -ne 75 ] || [ "$n" -ge 3 ]; then break; fi
+  n=$((n + 1))
+done
+# $rc is the result; 75 here means slotr stopped all three attempts.
+```
+
+Never retry without a cap. Under sustained pressure an uncapped loop is
+restarted and stopped again every recovery window.
+
 ## Exit codes
 
 - Normal workload exit codes are relayed.

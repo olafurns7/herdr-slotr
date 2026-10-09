@@ -19,6 +19,31 @@ probe = 7
 [pools.runtime.legacy_lock]
 path = "/tmp/runtime.lock"
 mode = "shared"
+# Heavy one-shot commands: type checks, lint, tests, builds, installs.
+# A stopped run exits 75 and is re-run; installs and builds included.
+[pools.heavy]
+slots = 2
+memory_gated = true
+evictable = true
+default_cost_mib = 6144
+# A run past one hour is stopped as lease_expired when another campaign waits.
+max_lease = "1h"
+campaign_cap = 0
+[pools.heavy.kinds.tsc]
+cost_mib = 6144
+[pools.heavy.kinds.oxlint]
+cost_mib = 6144
+[pools.heavy.kinds.vitest]
+cost_mib = 4096
+[pools.heavy.kinds.build]
+cost_mib = 6144
+[pools.heavy.kinds.install]
+cost_mib = 3072
+# Old `flock /tmp/heavy.lock CMD` callers keep working during a transition,
+# but they ignore priority and queue order.
+[pools.heavy.legacy_lock]
+path = "/tmp/heavy.lock"
+mode = "shared"
 [admission]
 reserve_mib = 5120
 psi_full_avg60_max = 5.0
@@ -26,6 +51,8 @@ load1_per_core_max = 0.0
 recovery_healthy_seconds = 30.0
 queue_poll_ms = 1000
 [watchdog]
+# The stop event records this lock as held only when an old exclusive
+# flock caller holds it; the heavy pool's own shared holders do not count.
 observe_locks = ["/tmp/heavy.lock"]
 interval_ms = 2000
 on_pressure = "stop"
