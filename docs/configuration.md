@@ -42,8 +42,10 @@ SLOTR_POOLS__RUNTIME__SLOTS=3
 SLOTR_LEASE__ON_EXPIRY=warn
 ```
 
-Pool and kind names in environment paths are normalized to lowercase. Hook
-and observation arrays can also be overridden with TOML array syntax.
+Pool and kind names in environment paths are normalized to lowercase. Hook,
+observation, and priority campaign arrays use TOML array syntax.
+For example, `SLOTR_PRIORITY__CAMPAIGNS='["team-a", "team-b-*"]'` and
+`SLOTR_PRIORITY__FILE=~/priority` override both priority settings.
 
 ## Reference
 
@@ -69,6 +71,33 @@ These tables match `config.example.toml`. Durations use the suffixes `s`,
 
 Optional port tables default to base 31000, stride 32, and probe 7 when
 enabled. A legacy lock requires a path; its mode defaults to `shared`.
+
+### Priority
+
+| Priority key (`priority`) | Default | Meaning |
+| --- | --- | --- |
+| `campaigns` | `[]` | Exact campaign names or prefixes ending in `*`; matches get level 1 |
+| `file` | `""` | Optional level file; empty disables it; `~` expands to the home directory |
+
+The file uses one rule per line:
+
+```text
+# Higher numbers go first.
+campaign team-a 1
+campaign team-b-* 2
+task 123 3
+```
+
+Levels are unsigned 32-bit integers. A run gets the highest matching level
+from the static list and file. No match means level 0. Task IDs match exactly.
+Blank lines and `#` comments are ignored. Malformed or truncated lines are
+skipped; other lines still apply. A missing or unreadable file adds no levels.
+There is no age limit. Waiters refresh each poll; holders refresh each watchdog
+tick. Status shows stored levels and the current file state.
+
+Writers must write a temp file beside the priority file, then rename it over
+the destination. This atomic rename prevents readers seeing a partial update.
+Remove the file or its rules to lift file priority. Static matches still apply.
 
 ### Admission
 

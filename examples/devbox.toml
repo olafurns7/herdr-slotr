@@ -1,4 +1,8 @@
 # Example only; no machine or tool-specific values are compiled into slotr.
+# Optional priority example:
+# [priority]
+# campaigns = ["team-a", "team-b-*"]
+# file = "~/.local/state/slotr/priority"
 [pools.runtime]
 slots = 2
 memory_gated = true

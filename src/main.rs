@@ -128,7 +128,7 @@ fn execute(cli: Cli) -> Result<i32> {
             Command::Status { .. } => {
                 println!(
                     "{}",
-                    serde_json::json!({"stats":stats::read(),"pools":cfg.pools,"events_path":config::xdg("XDG_STATE_HOME",".local/state").join("slotr/events.jsonl")})
+                    serde_json::json!({"stats":stats::read(),"pools":cfg.pools,"priority":cfg.priority.status(),"events_path":config::xdg("XDG_STATE_HOME",".local/state").join("slotr/events.jsonl")})
                 );
                 Ok(ExitCode::Success.value())
             }

@@ -17,6 +17,10 @@ campaign_cap = 1 # 0 disables the cap
 # [pools.default.kinds.dev-stack]
 # cost_mib = 7680
 
+[priority]
+campaigns = [] # exact names or a trailing * for a prefix; matches get level 1
+file = "" # empty disables the file; ~/ expands to the home directory
+
 [admission]
 reserve_mib = 5120
 psi_full_avg60_max = 5.0

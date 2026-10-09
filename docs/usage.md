@@ -15,8 +15,9 @@ slotr config check examples/devbox.toml
 slotr --version
 ```
 
-- `run` waits in FIFO order within a pool, accounts for reserved memory, and
-  runs the admitted command in a transient systemd user service. Each service
+- `run` waits in priority order, then FIFO within each level in a pool. It
+  accounts for reserved memory and runs the admitted command in a transient
+  systemd user service. Each service
   contains its own supervisor; there is no daemon or remote service.
 - `status` shows holders and the queue. `--json` prints JSON. It observes
   without creating, changing, or deleting files and without signalling any
@@ -47,7 +48,8 @@ slotr --version
 - `--lease 30m` requests a shorter lease; the pool's `max_lease` caps it.
   Duration suffixes are `s`, `m`, `h`, and `d`; a bare number is seconds and
   `"0"` means unlimited.
-- `--task ID` is an opaque string used in hook substitutions. `--pane PANE`
+- `--task ID` is an opaque string used in hook substitutions and exact
+  priority-file matches. `--pane PANE`
   also identifies the holder for the optional liveness probe. Pass the pane
   ID (`--pane "$HERDR_PANE_ID"`) on the same Herdr server, not an agent name.
   Moving a pane changes its ID; the original ID then reads as gone.
@@ -64,6 +66,14 @@ The workload receives these environment variables:
 - `SLOTR_PORT_BASE`, when a port block is configured
 
 On admission stderr prints exactly `slotr: admitted RUN`.
+Every automatic stop prints `slotr: stopped RUN: REASON` on stderr and
+returns exit code 75. Use the reason when deciding when to rerun the command.
+
+Status includes `level` for each holder and queue entry in text and JSON.
+Each pool's queue is listed in effective order: uncapped tickets first,
+highest level first, then enqueue sequence. The `priority` block reports
+file `state` as `off`, `ok` with `age_seconds`, or `missing` for an unreadable
+or absent file. Levels are the last values refreshed by each run.
 
 ## Example: a development stack
 

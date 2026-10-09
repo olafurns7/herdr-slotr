@@ -14,6 +14,71 @@ pub struct Config {
     pub watchdog: Watchdog,
     pub lease: Lease,
     pub hooks: Hooks,
+    pub priority: Priority,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Priority {
+    pub campaigns: Vec<String>,
+    pub file: String,
+}
+impl Priority {
+    fn path(&self) -> PathBuf {
+        if self.file == "~" {
+            PathBuf::from(env::var_os("HOME").unwrap_or_default())
+        } else if let Some(rest) = self.file.strip_prefix("~/") {
+            PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(rest)
+        } else {
+            PathBuf::from(&self.file)
+        }
+    }
+    pub fn level(&self, campaign: &str, task: &str) -> u32 {
+        let matches = |pattern: &str| {
+            pattern
+                .strip_suffix('*')
+                .map_or(pattern == campaign, |prefix| campaign.starts_with(prefix))
+        };
+        let mut level = u32::from(self.campaigns.iter().any(|p| matches(p)));
+        if !self.file.is_empty()
+            && let Ok(bytes) = fs::read(self.path())
+        {
+            for line in bytes
+                .split(|b| *b == b'\n')
+                .filter_map(|line| std::str::from_utf8(line).ok())
+            {
+                let fields: Vec<_> = line
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
+                if let [kind, name, value] = fields.as_slice()
+                    && ((*kind == "campaign" && matches(name))
+                        || (*kind == "task" && *name == task))
+                    && let Ok(value) = value.parse::<u32>()
+                {
+                    level = level.max(value);
+                }
+            }
+        }
+        level
+    }
+    pub fn status(&self) -> serde_json::Value {
+        if self.file.is_empty() {
+            serde_json::json!({"state":"off"})
+        } else {
+            let path = self.path();
+            if fs::read(&path).is_ok() {
+                let age = fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map_or(0, |age| age.as_secs());
+                serde_json::json!({"state":"ok", "age_seconds":age})
+            } else {
+                serde_json::json!({"state":"missing"})
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Pool {
