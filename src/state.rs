@@ -60,6 +60,10 @@ pub struct Holder {
     pub cpu_usage_usec: Option<u64>,
     #[serde(default, with = "crate::timestamp::optional")]
     pub cpu_sample_at: Option<f64>,
+    #[serde(default, with = "crate::timestamp::optional")]
+    pub holder_idle_since: Option<f64>,
+    #[serde(default)]
+    pub holder_idle_warned: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StopRecord {

@@ -44,6 +44,10 @@ enum Command {
     Stop {
         run: String,
     },
+    /// Reset a holder's idle clocks without renewing its lease.
+    Touch {
+        run: String,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -107,6 +111,10 @@ fn execute(cli: Cli) -> Result<i32> {
             Command::Run(args) => runtime::run(args, &cfg),
             Command::Supervise { run, cmd } => supervisor::supervise(&run, &cmd, &cfg),
             Command::Stop { run } => runtime::stop(&run),
+            Command::Touch { run } => {
+                supervisor::touch(&run)?;
+                Ok(ExitCode::Success.value())
+            }
             Command::Status { json } => {
                 runtime::status(&cfg, json)?;
                 Ok(ExitCode::Success.value())
@@ -124,7 +132,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 );
                 Ok(ExitCode::Success.value())
             }
-            _ => anyhow::bail!("run and stop require Linux and a systemd user bus"),
+            _ => anyhow::bail!("run, stop and touch require Linux and a systemd user bus"),
         }
     }
 }
