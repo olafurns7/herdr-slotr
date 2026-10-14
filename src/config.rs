@@ -127,6 +127,8 @@ pub struct Ports {
 pub struct Legacy {
     pub path: String,
     pub mode: String,
+    #[serde(default)]
+    pub queue_only: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Kind {
@@ -212,7 +214,9 @@ fn schema(path: &str) -> Result<Value> {
             Ok(pool_template())
         }
         ["pools", _, "ports"] => Ok(toml::from_str("base=31000\nstride=32\nprobe=7")?),
-        ["pools", _, "legacy_lock"] => Ok(toml::from_str("path=\"\"\nmode=\"shared\"")?),
+        ["pools", _, "legacy_lock"] => Ok(toml::from_str(
+            "path=\"\"\nmode=\"shared\"\nqueue_only=false",
+        )?),
         ["pools", _, "kinds"] => Ok(Value::Table(Default::default())),
         ["pools", _, "kinds", _] => Ok(toml::from_str("cost_mib=7680")?),
         _ => bail!("config {path}: unknown key"),
@@ -273,11 +277,26 @@ fn leaves(v: &Value, path: &str, out: &mut BTreeMap<String, String>) {
     }
 }
 pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
+    load_with_env(file, true)
+}
+#[cfg(target_os = "linux")]
+pub fn load_fixed(file: &Path) -> Result<Config> {
+    ensure!(file.is_absolute(), "flock guard config must be absolute");
+    Ok(load_with_env(Some(file), false)?.0)
+}
+fn load_with_env(
+    file: Option<&Path>,
+    overrides: bool,
+) -> Result<(Config, BTreeMap<String, String>)> {
     let mut value: Value = toml::from_str(include_str!("../config.example.toml"))?;
     let mut sources = BTreeMap::new();
-    let path = file
-        .map(Path::to_path_buf)
-        .or_else(|| env::var_os("SLOTR_CONFIG").map(PathBuf::from));
+    let path = file.map(Path::to_path_buf).or_else(|| {
+        if overrides {
+            env::var_os("SLOTR_CONFIG").map(PathBuf::from)
+        } else {
+            None
+        }
+    });
     let explicit = path.is_some();
     let path = path.unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("slotr/config.toml"));
     ensure!(
@@ -299,6 +318,7 @@ pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
     for (key, raw) in env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .filter(|(k, _)| k.starts_with("SLOTR_") && k.contains("__"))
+        .filter(|_| overrides)
     {
         let parts: Vec<_> = key[6..].split("__").map(str::to_lowercase).collect();
         let path = parts.join(".");

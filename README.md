@@ -38,6 +38,7 @@ Also creates the config from the example when none exists, then checks it.
 - [Install](docs/install.md)
 - [Agent setup](docs/agent-setup.md)
 - [Usage](docs/usage.md)
+- [Cooperative flock guard](docs/flock.md)
 - [Configuration](docs/configuration.md)
 - [How it works](docs/how-it-works.md)
 - [Troubleshooting](docs/troubleshooting.md)

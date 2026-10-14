@@ -115,6 +115,18 @@ cap, or its legacy lock holds nobody.
 
 ## Config
 
+**`flock guard refused`.** A queue-only target prints its pool/path and a
+`slotr run` recipe. Submit the original workload with its real campaign and
+purpose. Missing/invalid policy, no protected entries, missing/nonregular
+protected files, unknown/ambiguous options, and unresolved target identities
+also exit 2 before native execution. Check the launcher's compile-time absolute binary
+and config paths; changing HOME or `SLOTR_CONFIG` cannot change guard policy.
+For unrelated missing targets, the checker silently allows; the launcher
+then lets native flock decide creation/error behavior. Launcher checker
+exec/fork/wait/restore errors, signal death, and stops also prevent native
+execution; fix the checker or launcher before retrying.
+See [flock.md](flock.md) for the pinned grammar and stable-namespace requirement.
+
 `slotr config check` prints `slotr: config OK` or the first error. Errors
 name the bad key, for example:
 

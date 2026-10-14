@@ -36,6 +36,10 @@ Unknown keys, invalid values, and wrong types name the bad key and exit 2.
 - Other sections merge with defaults.
 - Environment values override the file.
 
+The opt-in `slotr flock-check --config ABSOLUTE_FILE -- NATIVE_ARGS` checker reads
+only that file and skips all environment overrides for policy. See
+[the cooperative flock guard](flock.md); normal commands keep the rules above.
+
 ## Environment overrides
 
 Every scalar has an environment override: uppercase the full dotted path,
@@ -71,10 +75,14 @@ These tables match `config.example.toml`. Durations use the suffixes `s`,
 | `ports.probe` | absent | Optional first N ports to bind-probe; example 7 |
 | `legacy_lock.path` | absent | Optional compatibility flock file |
 | `legacy_lock.mode` | absent | `shared` or `exclusive`; both are nonblocking probes |
+| `legacy_lock.queue_only` | `false` | Refuse native use of this existing absolute regular file through the opt-in flock guard |
 | `kinds.K.cost_mib` | absent | Optional named request cost |
 
 Optional port tables default to base 31000, stride 32, and probe 7 when
 enabled. A legacy lock requires a path; its mode defaults to `shared`.
+`queue_only` does not change slotr's own lock acquisition. Guard policy needs
+at least one protected file; runtime locks may stay false. See [flock.md](flock.md)
+for fixed config selection, compatibility limits and migration requirements.
 
 Kinds belong to each pool; they are not global aliases. The example `heavy`
 pool defines `tsc`, `oxlint`, `vitest`, `build`, and `install`. Select only

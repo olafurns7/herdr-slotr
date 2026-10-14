@@ -2,6 +2,8 @@
 mod admission;
 mod config;
 #[cfg(target_os = "linux")]
+mod flock;
+#[cfg(target_os = "linux")]
 mod manager;
 #[cfg(target_os = "linux")]
 mod runtime;
@@ -37,6 +39,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Run(Run),
+    /// Check native flock arguments; silent success permits the native launcher.
+    FlockCheck {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(last = true, required = true)]
+        args: Vec<std::ffi::OsString>,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -86,6 +95,15 @@ enum ConfigCommand {
     Check { file: Option<PathBuf> },
 }
 fn execute(cli: Cli) -> Result<i32> {
+    if let Command::FlockCheck { config, args } = cli.command {
+        #[cfg(target_os = "linux")]
+        return flock::check(&config, &args);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (config, args);
+            anyhow::bail!("flock guard requires Linux");
+        }
+    }
     if let Command::Config { command } = cli.command {
         match command {
             ConfigCommand::Show => {
@@ -119,7 +137,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 runtime::status(&cfg, json)?;
                 Ok(ExitCode::Success.value())
             }
-            Command::Config { .. } => unreachable!(),
+            Command::Config { .. } | Command::FlockCheck { .. } => unreachable!(),
         }
     }
     #[cfg(not(target_os = "linux"))]

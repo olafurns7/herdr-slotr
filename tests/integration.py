@@ -1697,6 +1697,41 @@ class AdmissionTest(unittest.TestCase):
         first.wait(timeout=3)
         self.wait(p2.exists)
 
+    def test_queue_only_guard_retains_priority_and_fifo(self):
+        path = self.runtime / 'legacy-heavy.lock'
+        path.touch()
+        self.cfg.update(heavy=dict(slots=1, legacy_lock=dict(path=str(path), mode='shared', queue_only=True)),
+                        waiter_age=1000, priority=dict(campaigns=['P*']))
+        self.write_config()
+        self.set_stats(40000)
+        holder, output = self.start('holder', pool='heavy')
+        self.wait(output.exists)
+        _, n = self.start('N', pool='heavy')
+        self.wait(lambda: len(self.status()['pools']['heavy']['queue']) == 1)
+        first, p1 = self.start('P1', pool='heavy')
+        self.wait(lambda: len(self.status()['pools']['heavy']['queue']) == 2)
+        second, p2 = self.start('P2', pool='heavy')
+        self.wait(lambda: [q['campaign'] for q in self.status()['pools']['heavy']['queue']] == ['P1', 'P2', 'N'])
+        marker = self.root / 'bare-payload'
+        refused = self.invoke('flock-check', '--config', str(self.root / 'config/slotr/config.toml'), '--',
+                              str(path), '/usr/bin/touch', str(marker))
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn('slotr run --pool heavy', refused.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(self.status()['pools']['heavy']['queue']), 3)
+        holder.terminate()
+        holder.wait(timeout=3)
+        self.wait(p1.exists)
+        self.assertFalse(p2.exists())
+        self.assertFalse(n.exists())
+        first.terminate()
+        first.wait(timeout=3)
+        self.wait(p2.exists)
+        self.assertFalse(n.exists())
+        second.terminate()
+        second.wait(timeout=3)
+        self.wait(n.exists)
+
     def test_priority_does_not_pass_campaign_cap(self):
         self.cfg.update(priority=dict(campaigns=['P']), grace=1)
         self.write_config()
@@ -2062,6 +2097,501 @@ class AdmissionTest(unittest.TestCase):
         self.assertEqual(other.returncode, 75)
         self.assertIsNone(promoted.poll())
         self.assertEqual([e['run'] for e in self.events('stop')], ['slotr-runtime-1'])
+
+class FlockTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='slotr-flock-test-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.protected = self.root / 'heavy.lock'
+        self.protected.touch()
+        self.runtime = self.root / 'runtime.lock'
+        self.runtime.touch()
+        self.policy = self.root / 'config.toml'
+        self.policy.write_text(f'''[pools.heavy.legacy_lock]
+path = {json.dumps(str(self.protected))}
+mode = "shared"
+queue_only = true
+[pools.runtime.legacy_lock]
+path = {json.dumps(str(self.runtime))}
+mode = "exclusive"
+''')
+        self.shim = self.root / 'flock'
+        self.compile_launcher(self.shim, TOOL)
+        self.env = dict({k: v for k, v in os.environ.items() if not k.startswith('SLOTR_')},
+                        HOME=str(self.root / 'empty-home'), XDG_CONFIG_HOME=str(self.root / 'empty-config'),
+                        XDG_RUNTIME_DIR=str(self.root / 'queue'), XDG_STATE_HOME=str(self.root / 'state'),
+                        SHELL='/bin/sh')
+
+    def compile_launcher(self, output, checker):
+        source = Path(__file__).resolve().parents[1] / 'scripts/flock-shim.c'
+        result = subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+                                 '-DSLOTR_BINARY=' + json.dumps(str(checker)),
+                                 '-DSLOTR_CONFIG=' + json.dumps(str(self.policy)),
+                                 str(source), '-o', str(output)], capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def invoke(self, *args, **kwargs):
+        return subprocess.run([str(self.shim), *args], env=kwargs.pop('env', self.env),
+                              capture_output=True, timeout=4, **kwargs)
+
+    def shell(self, script, *args, **kwargs):
+        return subprocess.run(['/bin/sh', '-c', script, 'test', str(self.shim), *map(str, args)],
+                              env=self.env, capture_output=True, timeout=4, **kwargs)
+
+    def refused(self, result):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b'slotr run --pool', result.stderr)
+        self.assertFalse((self.root / 'queue').exists())
+
+    def test_protected_aliases_and_descriptors_never_execute_or_lock(self):
+        symbolic = self.root / 'symbolic'
+        symbolic.symlink_to(self.protected)
+        hard = self.root / 'hard'
+        os.link(self.protected, hard)
+        marker = self.root / 'payload'
+        identity = self.protected.stat()
+        for path in [self.protected, symbolic, hard, './heavy.lock', './sub/../heavy.lock']:
+            (self.root / 'sub').mkdir(exist_ok=True)
+            for options in [[], ['-s'], ['-u'], ['-snw0'], ['--nonblock', '-E33']]:
+                with self.subTest(path=path, options=options):
+                    result = self.invoke(*options, str(path), '/usr/bin/touch', str(marker), cwd=self.root)
+                    self.refused(result)
+                    self.assertIn(b'heavy', result.stderr)
+                    self.assertIn(os.fsencode(self.protected), result.stderr)
+        for spelling in ['9', '+9', '09', ' 9', '\t9', '\v9', '\f9']:
+            self.refused(self.shell('exec 9<>"$2"; "$1" -n "$3"', self.protected, spelling))
+        for options in ['-s', '-u', '-w0', '-E33']:
+            self.refused(self.shell('exec 9<>"$2"; "$1" "$3" 9', self.protected, options))
+        self.refused(self.shell('exec 9<>"$2"; "$1" /proc/self/fd/9 /usr/bin/touch "$3"', self.protected, marker))
+        with self.protected.open('r+b') as fd:
+            self.refused(self.invoke('--', '-0', stdin=fd))
+        self.assertFalse(marker.exists())
+        self.assertEqual((identity.st_dev, identity.st_ino), (self.protected.stat().st_dev, self.protected.stat().st_ino))
+        with self.protected.open('r+b') as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_native_file_directory_shell_and_byte_preservation(self):
+        self.assertEqual(subprocess.run(['/usr/bin/flock', '--version'], capture_output=True).stdout,
+                         b'flock from util-linux 2.39.3\n')
+        directory = self.root / 'directory'
+        directory.mkdir()
+        dangling = self.root / 'dangling'
+        dangling.symlink_to(self.root / 'referent')
+        for path in [self.runtime, directory, self.root / 'new', dangling, self.root / '9']:
+            with self.subTest(path=path):
+                result = self.invoke('-n', str(path), '/bin/sh', '-c', 'exit 17')
+                self.assertEqual(result.returncode, 17, result.stderr)
+        self.assertTrue((self.root / 'referent').is_file())
+        missing = self.root / 'missing-parent/lock'
+        self.assertEqual(self.invoke(str(missing), '/usr/bin/true').returncode,
+                         subprocess.run(['/usr/bin/flock', str(missing), '/usr/bin/true'], capture_output=True).returncode)
+        self.assertFalse(missing.parent.exists())
+        for options in [['-s'], ['-e'], ['-x'], ['-u'], ['-w', '0'], ['-E33'], ['-o'], ['-F'],
+                        ['--shared'], ['--exclusive'], ['--unlock'], ['--nb'], ['--non'],
+                        ['--wait=0'], ['--timeout', '0'], ['--conflict-exit-code', '33'],
+                        ['--close'], ['--no-fork'], ['--verbose'], ['--sh'], ['--ex'], ['--un'],
+                        ['--ti=0'], ['--wa=0'], ['--con=33'], ['--cl'], ['--no-f'], ['--verb'], ['--']]:
+            with self.subTest(options=options):
+                result = self.invoke(*options, str(self.runtime), '/bin/sh', '-c', 'exit 19')
+                self.assertEqual(result.returncode, 19, result.stderr)
+        for marker in ['-c', '--command']:
+            self.assertEqual(self.invoke(str(self.runtime), marker, 'exit 23').returncode, 23)
+        path = os.fsencode(self.root) + b'/nonutf8-\xff.lock'
+        result = self.invoke(path, os.fsencode(sys.executable), b'-c',
+                             b'import os,sys;sys.stdout.buffer.write(os.fsencode(sys.argv[1]))', b'--payload-\xff')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'--payload-\xff')
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(self.invoke(str(self.runtime), '/bin/sh', '-c', 'kill -TERM $$').returncode, 128 + signal.SIGTERM)
+        self.assertEqual(self.invoke('-F', str(self.runtime), '/bin/sh', '-c', 'kill -TERM $$').returncode, -signal.SIGTERM)
+        for option in ['--help', '--version', '-h?', '-V?', '--he', '--vers']:
+            guarded = self.invoke(option, '--unknown')
+            native = subprocess.run(['/usr/bin/flock', option, '--unknown'], capture_output=True)
+            self.assertEqual((guarded.returncode, guarded.stdout), (native.returncode, native.stdout))
+
+    def test_watch_fd9_persists_conflicts_and_unlocks(self):
+        script = '''
+exec 9<>"$2"
+"$1" -n 9 || exit 90
+/usr/bin/flock -n -E33 "$2" /usr/bin/true
+[ "$?" = 33 ] || exit 91
+"$1" -n -E33 "$2" /usr/bin/true
+[ "$?" = 33 ] || exit 92
+"$1" -w 0 -E 34 "$2" /usr/bin/true
+[ "$?" = 34 ] || exit 93
+"$1" -w .02 -E35 "$2" /usr/bin/true
+[ "$?" = 35 ] || exit 94
+"$1" -u 9 || exit 95
+/usr/bin/flock -n "$2" /usr/bin/true || exit 96
+"$1" -s +9 || exit 97
+/usr/bin/flock -s -n "$2" /usr/bin/true || exit 98
+/usr/bin/flock -x -n -E36 "$2" /usr/bin/true
+[ "$?" = 36 ] || exit 99
+"$1" -u 09
+'''
+        result = self.shell(script, self.runtime)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for spelling in ['+9', '09', ' 9', '\t9', '\v9', '\f9']:
+            result = self.shell('exec 9<>"$2"; "$1" -n "$3" || exit; /usr/bin/flock -n -E33 "$2" true; [ "$?" = 33 ]', self.runtime, spelling)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with self.runtime.open('r+b') as fd:
+            self.assertEqual(self.invoke('--', '-0', stdin=fd).returncode, 0)
+            with self.runtime.open('r+b') as independent:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.invoke('-u', '0', stdin=fd).returncode, 0)
+
+    def test_fixed_policy_ignores_overrides_and_preserves_payload_environment_fds(self):
+        hostile = dict(self.env, SLOTR_CONFIG=str(self.root / 'absent.toml'),
+                       SLOTR_POOLS__HEAVY__LEGACY_LOCK__QUEUE_ONLY='false',
+                       SLOTR_POOLS__HEAVY__LEGACY_LOCK__PATH=str(self.runtime),
+                       SLOTR_ADMISSION__QUEUE_POLL_MS='not-a-number')
+        self.refused(self.invoke(str(self.protected), '/usr/bin/true', env=hostile))
+        result = self.invoke(str(self.runtime), sys.executable, '-c',
+                             'import json,os;print(json.dumps(dict(os.environ)))', env=hostile)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), hostile)
+        self.runtime.write_bytes(b'preserved-contents')
+        result = self.shell('exec 9<"$2"; "$1" "$3" "$4" -c \'import os;os.write(1,os.read(9,100))\'', self.runtime, self.root / 'other', sys.executable)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'preserved-contents')
+
+    def test_invalid_policy_and_uncertain_target_fail_closed(self):
+        valid = self.policy.read_text()
+        for policy in ['', 'bad = [', '[pools.heavy]\nslots=1\n',
+                       valid.replace('queue_only = true', 'queue_only = false'),
+                       valid.replace('queue_only = true', 'queue_only = "yes"'),
+                       valid.replace(str(self.protected), 'relative.lock'),
+                       valid.replace(str(self.protected), str(self.root / 'absent')),
+                       valid.replace(str(self.protected), str(self.root))]:
+            with self.subTest(policy=policy):
+                self.policy.write_text(policy)
+                self.refused(self.invoke(str(self.root / 'uncreated'), '/usr/bin/true'))
+                self.refused(self.invoke('--help'))
+                self.assertFalse((self.root / 'uncreated').exists())
+        self.policy.unlink()
+        self.refused(self.invoke(str(self.runtime), '/usr/bin/true'))
+        self.policy.write_text(valid)
+        relative = subprocess.run([str(TOOL), 'flock-check', '--config', 'config.toml', '--',
+                                   str(self.runtime), '/usr/bin/true'], cwd=self.root, env=self.env, capture_output=True)
+        self.refused(relative)
+        loop = self.root / 'loop'
+        loop.symlink_to(loop)
+        self.refused(self.invoke(str(loop), '/usr/bin/true'))
+        self.policy.write_text(valid.replace(str(self.protected), str(loop)))
+        self.refused(self.invoke(str(self.runtime), '/usr/bin/true'))
+        self.policy.write_text(valid)
+        if os.geteuid() != 0:
+            denied = self.root / 'denied'
+            denied.mkdir()
+            denied.chmod(0)
+            try:
+                self.refused(self.invoke(str(denied / 'lock'), '/usr/bin/true'))
+            finally:
+                denied.chmod(0o700)
+        self.protected.rename(self.root / 'renamed')
+        self.refused(self.invoke(str(self.runtime), '/usr/bin/true'))
+
+    def test_ambiguous_or_malformed_native_syntax_refuses(self):
+        for args in [[], ['--n'], ['--no'], ['--v'], ['--c'], ['--future'], ['--command'],
+                     ['--shared=1'], ['--help=x'], ['-w'], ['-E'], ['--timeout'], ['--conflict-exit-code'],
+                     ['-?h'], ['-0'], ['--', '-1'], ['9 '], ['0x9'], ['2147483648'], ['99999'],
+                     [str(self.runtime), '-c'], [str(self.runtime), '--command', 'true', 'extra']]:
+            with self.subTest(args=args):
+                result = self.invoke(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+        # A value that resembles help is consumed, so it cannot bypass target refusal.
+        self.refused(self.invoke('-w', '--help', str(self.protected), '/usr/bin/true'))
+
+    def test_checker_is_silent_and_never_executes_native_or_payload(self):
+        target, marker = self.root / 'checker-target', self.root / 'checker-payload'
+        result = subprocess.run([str(TOOL), 'flock-check', '--config', str(self.policy), '--',
+                                 str(target), '/usr/bin/touch', str(marker)], env=self.env,
+                                capture_output=True, timeout=4)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b'', b''))
+        self.assertFalse(target.exists())
+        self.assertFalse(marker.exists())
+        old = subprocess.run([str(TOOL), 'flock', '--config', str(self.policy), '--',
+                              str(target), '/usr/bin/touch', str(marker)], env=self.env,
+                             capture_output=True, timeout=4)
+        self.assertEqual(old.returncode, 2)
+        self.assertFalse(target.exists())
+        self.assertFalse(marker.exists())
+
+    def test_native_raw_environment_argv_and_stdin_from_original_state(self):
+        raw = {os.fsencode(k): os.fsencode(v) for k, v in self.env.items()}
+        raw.update({b'ODD-NAME': b'odd', b'BASH_FUNC_sample%%': b'() { :; }',
+                    b'BAD\xffNAME': b'raw\xfe', b'PWD': b'/caller/pwd', b'EMPTY': b'',
+                    b'SLOTR_CONFIG': b'/absent', b'SLOTR_POOLS__HEAVY__LEGACY_LOCK__QUEUE_ONLY': b'false'})
+        outputs = []
+        for tool in ['/usr/bin/flock', str(self.shim)]:
+            result = subprocess.run([tool, str(self.runtime), '/usr/bin/env', '-0'], env=raw,
+                                    capture_output=True, timeout=4, restore_signals=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(dict(entry.split(b'=', 1) for entry in result.stdout.split(b'\0') if entry))
+        self.assertEqual(outputs, [raw, raw])
+        args = [b'', b'a b', b'raw\xff', b'--', b'\n', b'$()']
+        outputs = []
+        for tool in ['/usr/bin/flock', str(self.shim)]:
+            result = subprocess.run([os.fsencode(tool), os.fsencode(self.runtime), os.fsencode(sys.executable), b'-c',
+                                     b'import os,sys;sys.stdout.buffer.write(b"\\0".join(os.fsencode(a) for a in sys.argv[1:]))',
+                                     *args], env=self.env, capture_output=True, timeout=4, restore_signals=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout)
+        self.assertEqual(outputs, [b'\0'.join(args)] * 2)
+        data = b'stdin\0raw\xff\n'
+        for tool in ['/usr/bin/flock', str(self.shim)]:
+            result = subprocess.run([tool, str(self.runtime), '/usr/bin/cat'], env=self.env,
+                                    input=data, capture_output=True, timeout=4, restore_signals=False)
+            self.assertEqual((result.returncode, result.stdout), (0, data), result.stderr)
+
+    def test_native_mask_dispositions_epipe_and_closed_standard_fds(self):
+        def state(ignore_chld, block):
+            def setup():
+                signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+                signal.signal(signal.SIGCHLD, signal.SIG_IGN if ignore_chld else signal.SIG_DFL)
+                signal.pthread_sigmask(signal.SIG_SETMASK, block)
+            return setup
+        for ignore in [False, True]:
+            for block in [[], [signal.SIGUSR1], [signal.SIGCHLD], [signal.SIGUSR1, signal.SIGCHLD]]:
+                outputs = []
+                for tool in ['/usr/bin/flock', str(self.shim)]:
+                    result = subprocess.run([tool, '-F', str(self.runtime), '/usr/bin/cat', '/proc/self/status'],
+                                            env=self.env, capture_output=True, timeout=4, restore_signals=False,
+                                            preexec_fn=state(ignore, block))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    outputs.append([line for line in result.stdout.splitlines()
+                                    if line.startswith((b'SigBlk:', b'SigIgn:', b'SigPnd:', b'ShdPnd:'))])
+                self.assertEqual(outputs[0], outputs[1], (ignore, block))
+        # printf is executed directly; its EPIPE diagnostic/exit proves ignored SIGPIPE behavior.
+        for tool in ['/usr/bin/flock', str(self.shim)]:
+            read, write = os.pipe()
+            os.close(read)
+            try:
+                result = subprocess.run([tool, '-F', str(self.runtime), '/usr/bin/printf', 'data'],
+                                        env=self.env, stdout=write, stderr=subprocess.PIPE, timeout=4,
+                                        restore_signals=False, preexec_fn=state(False, []))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(b'Broken pipe', result.stderr)
+            finally:
+                os.close(write)
+        for fd in range(3):
+            outputs = []
+            for tool in ['/usr/bin/flock', str(self.shim)]:
+                result = subprocess.run([tool, '-n', str(fd)], env=self.env, capture_output=True,
+                                        timeout=4, restore_signals=False, preexec_fn=lambda fd=fd: os.close(fd))
+                outputs.append((result.returncode, result.stdout, result.stderr))
+            self.assertEqual(outputs[0], outputs[1], fd)
+        marker = self.root / 'standard-fd-payload'
+        for fd in [0, 1, 2, 9]:
+            self.protected.write_bytes(b'')
+            def opened(fd=fd):
+                owned = os.open(self.protected, os.O_RDWR)
+                os.dup2(owned, fd, inheritable=True)
+                if owned != fd:
+                    os.close(owned)
+            result = subprocess.run([str(self.shim), '-n', str(fd)], env=self.env, capture_output=True,
+                                    timeout=4, preexec_fn=opened, restore_signals=False, close_fds=False)
+            self.assertEqual(result.returncode, 2, (fd, result.stderr))
+            diagnostic = self.protected.read_bytes() if fd == 2 else result.stderr
+            self.assertIn(b'queue-only pool heavy', diagnostic)
+            self.assertIn(os.fsencode(self.protected), diagnostic)
+            self.protected.write_bytes(b'')
+            result = subprocess.run([str(self.shim), f'/proc/self/fd/{fd}', '/usr/bin/touch', str(marker)],
+                                    env=self.env, capture_output=True, timeout=4, preexec_fn=opened,
+                                    restore_signals=False, close_fds=False)
+            self.assertEqual(result.returncode, 2, (fd, result.stderr))
+            diagnostic = self.protected.read_bytes() if fd == 2 else result.stderr
+            self.assertIn(b'queue-only pool heavy', diagnostic)
+            self.assertIn(os.fsencode(self.protected), diagnostic)
+            self.assertFalse(marker.exists())
+
+    def test_checker_failures_and_stops_never_run_native(self):
+        checker = self.root / 'fake-checker'
+        launcher = self.root / 'failure-launcher'
+        self.compile_launcher(launcher, checker)
+        for mode, body in [('missing', None), ('nonexec', '#!/bin/sh\nexit 0\n'),
+                           ('exit1', '#!/bin/sh\nexit 1\n'), ('exit2', '#!/bin/sh\nexit 2\n'),
+                           ('signal', '#!/bin/sh\nkill -TERM "$$"\n'), ('stop', '#!/bin/sh\nkill -STOP "$$"\n')]:
+            if checker.exists():
+                checker.unlink()
+            if body is not None:
+                checker.write_text(body)
+                checker.chmod(0o600 if mode == 'nonexec' else 0o700)
+            for ignore in [False, True]:
+                for blocked in [False, True]:
+                    def state():
+                        signal.signal(signal.SIGCHLD, signal.SIG_IGN if ignore else signal.SIG_DFL)
+                        signal.pthread_sigmask(signal.SIG_SETMASK, [signal.SIGCHLD] if blocked else [])
+                    target, marker = self.root / 'failure-target', self.root / 'failure-marker'
+                    result = subprocess.run([str(launcher), str(target), '/usr/bin/touch', str(marker)],
+                                            env=self.env, capture_output=True, timeout=4, preexec_fn=state,
+                                            restore_signals=False)
+                    self.assertNotEqual(result.returncode, 0, (mode, ignore, blocked))
+                    self.assertFalse(target.exists())
+                    self.assertFalse(marker.exists())
+
+    def test_actual_launcher_source_faults_restoration_and_pending_boundary(self):
+        source = Path(__file__).resolve().parents[1] / 'scripts/flock-shim.c'
+        harness = self.root / 'launcher-harness.c'
+        harness.write_text(r'''
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static const char *mode;
+static int actions, waits, killed, native_called;
+static pid_t checker_child;
+static struct sigaction expected;
+static sigset_t expected_mask;
+static int real_child(void) { return !strncmp(mode, "real-", 5); }
+static int action(int sig, const struct sigaction *a, struct sigaction *old)
+{
+    actions++;
+    if ((!strcmp(mode, "snapshot") && actions == 1) ||
+        (!strcmp(mode, "prepare") && actions == 2) ||
+        (!strcmp(mode, "restore") && actions == 3)) {
+        errno = EIO;
+        return -1;
+    }
+    return sigaction(sig, a, old);
+}
+static pid_t owned_fork(void)
+{
+    if (real_child()) {
+        checker_child = fork();
+        return checker_child;
+    }
+    if (!strcmp(mode, "fork")) { errno = EAGAIN; return -1; }
+    return 424242;
+}
+static pid_t owned_wait(pid_t pid, int *status, int options)
+{
+    if (real_child()) {
+        assert(pid == checker_child && pid > 0);
+        waits++;
+        return waitpid(pid, status, options);
+    }
+    assert(pid == 424242);
+    waits++;
+    assert(options == (waits == 1 || !strcmp(mode, "eintr") ? WUNTRACED : 0));
+    if (!strcmp(mode, "eintr") && waits == 1) { errno = EINTR; return -1; }
+    if (!strcmp(mode, "wait")) { errno = ECHILD; return -1; }
+    if (!strcmp(mode, "wrong")) return pid + 1;
+    if (!strcmp(mode, "stop")) *status = waits == 1 ? (SIGSTOP << 8) | 0x7f : SIGKILL;
+    else if (!strcmp(mode, "signal")) *status = SIGTERM;
+    else if (!strcmp(mode, "unknown")) *status = 0xffff;
+    else *status = 0;
+    return pid;
+}
+static int owned_kill(pid_t pid, int sig)
+{
+    assert(pid == (real_child() ? checker_child : 424242) && sig == SIGKILL);
+    killed++;
+    return real_child() ? kill(pid, sig) : 0;
+}
+static void *allocation(size_t size)
+{
+    if (!strcmp(mode, "malloc")) { errno = ENOMEM; return NULL; }
+    return malloc(size);
+}
+static int execute(const char *path, char *const argv[])
+{
+    if (strcmp(path, "/usr/bin/flock")) return execv(path, argv);
+    native_called++;
+    struct sigaction restored;
+    sigset_t mask, pending;
+    assert(sigaction(SIGCHLD, NULL, &restored) == 0);
+    assert(sigprocmask(SIG_SETMASK, NULL, &mask) == 0);
+    assert(sigpending(&pending) == 0);
+    assert(restored.sa_handler == expected.sa_handler && restored.sa_flags == expected.sa_flags);
+    for (int s = 1; s < 65; s++) {
+        assert(sigismember(&restored.sa_mask, s) == sigismember(&expected.sa_mask, s));
+        assert(sigismember(&mask, s) == sigismember(&expected_mask, s));
+    }
+    if (!strcmp(mode, "real-block") || !strcmp(mode, "real-pending"))
+        assert(sigismember(&pending, SIGCHLD) == 1);
+    errno = ENOSYS; /* Observe before native exec, only in this isolated harness. */
+    return -1;
+}
+#define main launcher_main
+#define sigaction(...) action(__VA_ARGS__)
+#define fork() owned_fork()
+#define waitpid(...) owned_wait(__VA_ARGS__)
+#define kill(...) owned_kill(__VA_ARGS__)
+#define execv(...) execute(__VA_ARGS__)
+#define malloc(...) allocation(__VA_ARGS__)
+''' + '#include ' + json.dumps(str(source)) + r'''
+#undef main
+#undef sigaction
+#undef fork
+#undef waitpid
+#undef kill
+#undef execv
+#undef malloc
+int main(int argc, char **argv)
+{
+    assert(argc == 2);
+    mode = argv[1];
+    struct sigaction initial = {0};
+    initial.sa_handler = strstr(mode, "ignore") || !real_child() ? SIG_IGN : SIG_DFL;
+    initial.sa_flags = strstr(mode, "nocldwait") || !real_child() ? SA_NOCLDWAIT | SA_RESTART : 0;
+    assert(sigemptyset(&initial.sa_mask) == 0 && sigaddset(&initial.sa_mask, SIGUSR2) == 0);
+    assert(sigaction(SIGCHLD, &initial, NULL) == 0);
+    assert(sigaction(SIGCHLD, NULL, &expected) == 0);
+    assert(!(initial.sa_flags & SA_NOCLDWAIT) || (expected.sa_flags & SA_NOCLDWAIT));
+    assert(sigemptyset(&expected_mask) == 0 && sigaddset(&expected_mask, SIGUSR1) == 0);
+    if (strstr(mode, "block") || strstr(mode, "pending") || !real_child())
+        assert(sigaddset(&expected_mask, SIGCHLD) == 0);
+    assert(sigprocmask(SIG_SETMASK, &expected_mask, NULL) == 0);
+    if (strstr(mode, "pending")) assert(kill(getpid(), SIGCHLD) == 0);
+    char *args[] = {"launcher", "/uncreated/target", "/usr/bin/true", NULL};
+    int result = launcher_main(3, args);
+    int allowed = (real_child() && !strstr(mode, "fail") && !strstr(mode, "stop")) || !strcmp(mode, "eintr");
+    assert(native_called == allowed);
+    assert(result == (allowed ? 127 : strstr(mode, "fail") ? 1 : !strcmp(mode, "signal") ? 128 + SIGTERM : 2));
+    if (strstr(mode, "stop")) assert(killed == 1 && waits == 2);
+    if (!strcmp(mode, "eintr")) assert(waits == 2);
+    if (!strcmp(mode, "fork") || !strcmp(mode, "wait") || !strcmp(mode, "wrong") ||
+        !strcmp(mode, "stop") || !strcmp(mode, "signal") || !strcmp(mode, "unknown") ||
+        strstr(mode, "fail") || strstr(mode, "stop")) {
+        struct sigaction restored;
+        assert(sigaction(SIGCHLD, NULL, &restored) == 0);
+        assert(restored.sa_handler == expected.sa_handler && restored.sa_flags == expected.sa_flags);
+    }
+    puts("actual-source harness passed");
+    return 0;
+}
+''')
+        checker = self.root / 'harness-checker'
+        checker.symlink_to('/usr/bin/true')
+        executable = self.root / 'launcher-harness'
+        result = subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                                 '-DSLOTR_BINARY=' + json.dumps(str(checker)),
+                                 '-DSLOTR_CONFIG=' + json.dumps(str(self.policy)),
+                                 str(harness), '-o', str(executable)], capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for mode in ['malloc', 'snapshot', 'prepare', 'fork', 'wait', 'wrong', 'restore', 'stop',
+                     'signal', 'unknown', 'eintr', 'real-block', 'real-pending', 'real-ignore-block',
+                     'real-nocldwait', 'real-nocldwait-block', 'real-nocldwait-fail',
+                     'real-nocldwait-block-fail', 'real-nocldwait-stop', 'real-nocldwait-block-stop']:
+            checker.unlink()
+            if 'stop' in mode and mode.startswith('real-'):
+                checker.write_text('#!/bin/sh\nkill -STOP "$$"\n')
+                checker.chmod(0o700)
+            else:
+                checker.symlink_to('/usr/bin/false' if 'fail' in mode else '/usr/bin/true')
+            result = subprocess.run([str(executable), mode], env=self.env, capture_output=True,
+                                    timeout=4, restore_signals=False)
+            self.assertEqual(result.returncode, 0, (mode, result.stderr))
+            self.assertEqual(result.stdout, b'actual-source harness passed\n')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=True)

@@ -152,9 +152,14 @@ restarted and stopped again every recovery window.
 
 ## Exit codes
 
+For selectively refusing bare legacy flock calls, see the opt-in
+[cooperative flock guard](flock.md). Its checker uses a fixed absolute config; the optional native C launcher
+delegates unrelated native calls unchanged; it is not a host security policy.
+
 - Normal workload exit codes are relayed.
 - A signal returns 128 + the signal number.
 - 2 means a CLI, config, platform, or manager failure.
+  The flock guard also uses 2 for a protected target or uncertain policy/syntax.
 - 75 means slotr stopped the workload automatically (pressure, lease, yield,
   or idle release) when stderr also has the `slotr: stopped RUN: REASON`
   line. A workload's own exit 75 is relayed like any other code.

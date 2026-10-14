@@ -14,6 +14,7 @@ campaign_cap = 1 # 0 disables the cap
 # [pools.default.legacy_lock]
 # path = "/tmp/example-runtime.lock"
 # mode = "shared" # shared or exclusive
+# queue_only = false # opt-in cooperative flock guard; see docs/flock.md
 # [pools.default.kinds.dev-stack]
 # cost_mib = 7680
 

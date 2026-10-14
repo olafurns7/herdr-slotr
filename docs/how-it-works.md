@@ -127,6 +127,13 @@ fairness, so steady overlapping shared holders can keep an exclusive caller
 waiting a long time. Move callers to `slotr run` together, and read the
 `legacy_lock` wait reasons in status during the transition.
 
+The optional [flock guard](flock.md) refuses file/FD aliases of existing
+`queue_only` legacy files by device/inode in the Rust checker. After silent
+checker success, the native C launcher execs `/usr/bin/flock` with original argv, environment
+and FDs. This cooperative PATH launcher does not alter admission, supervision,
+or slotr's own legacy locks, and requires a stable policy/lock namespace.
+Direct native calls and deliberate namespace substitution can bypass it.
+
 ## Units
 
 Each admitted command runs in a transient systemd user service with its own
