@@ -471,6 +471,31 @@ class AdmissionTest(unittest.TestCase):
         state = json.loads((self.runtime / 'slotr/state.json').read_text())
         self.assertEqual(len(state['holders']), 1)
 
+    def test_unknown_kind_lists_selected_pool_and_never_admits(self):
+        self.cfg['heavy'] = dict(kinds={name: dict(cost_mib=6144)
+                                      for name in ('vitest', 'tsc', 'oxlint', 'install', 'build')})
+        self.write_config()
+        marker = self.root / 'payload'
+        for pool, kind, valid in (('heavy', 'tests', 'build, install, oxlint, tsc, vitest'),
+                                  ('heavy', 'lint', 'build, install, oxlint, tsc, vitest'),
+                                  ('runtime', 'build', 'dev-stack'),
+                                  ('heavy', 'build', 'none')):
+            with self.subTest(pool=pool, kind=kind, valid=valid):
+                if valid == 'none':
+                    self.cfg['heavy'] = {}
+                    self.write_config()
+                result = subprocess.run([str(TOOL), 'run', '--pool', pool, '--kind', kind,
+                                         '--campaign', 'kind-check', '--purpose', 'test', '--',
+                                         sys.executable, '-c', 'from pathlib import Path; Path(%r).touch()' % str(marker)],
+                                        env=self.env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.strip(),
+                                 f'slotr: unknown kind: {kind} (pool {pool}; valid kinds: {valid})')
+                self.assertFalse(marker.exists())
+                self.assertFalse((self.runtime / 'slotr').exists())
+                self.assertFalse((self.runtime / 'launches').exists())
+                self.assertFalse((self.root / 'state/slotr').exists())
+
     def test_corrupt_config_unknown_kind_and_no_bus(self):
         self.cfg['unknown'] = 1
         self.write_config()
@@ -733,6 +758,7 @@ class AdmissionTest(unittest.TestCase):
         self.assertIn("admission.surprise", result.stderr)
         (self.root / "config/slotr/config.toml").unlink()
         result = self.invoke("config", "show")
+        self.assertEqual(result.returncode, 0, result.stderr)
         built_in = json.loads(result.stdout)["config"]
         example = tomllib.loads((Path(__file__).resolve().parents[1] / "config.example.toml").read_text())
         for pool in built_in["pools"].values():
@@ -741,6 +767,65 @@ class AdmissionTest(unittest.TestCase):
             pool.pop("kinds")
         self.assertEqual(built_in, example)
         self.assertEqual(self.invoke("config", "check", str(self.root / "missing")).returncode, 2)
+
+    def test_explicit_config_required_and_file_precedence(self):
+        config = self.root / 'config/slotr/config.toml'
+        missing = str(self.root / 'missing.toml')
+        for selected, diagnostic in ((missing, f'config {missing}:'), ('', 'config path must not be empty')):
+            with self.subTest(selected=selected):
+                env = dict(self.env, SLOTR_CONFIG=selected)
+                for args in (('config', 'show'), ('config', 'check'), ('run', '--', 'true')):
+                    result = self.invoke(*args, env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+                self.assertFalse((self.runtime / 'slotr').exists())
+                result = self.invoke('config', 'check', str(config), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('slotr: config OK', result.stdout)
+        result = self.invoke('config', 'check', missing, env=dict(self.env, SLOTR_CONFIG=str(config)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f'config {missing}:', result.stderr)
+
+    def test_absolute_config_and_payload_scratch_home_preserve_queue(self):
+        scratch = self.root / 'scratch-home'
+        scratch.mkdir()
+        priority = self.priority_file('task test-task 3\n')
+        self.cfg.update(heavy=dict(kinds=dict(build=dict(cost_mib=6144))),
+                        priority=dict(campaigns=[], file='~/priority'))
+        self.write_config()
+        env = dict(self.env, SLOTR_CONFIG=str(self.root / 'config/slotr/config.toml'),
+                   XDG_CONFIG_HOME=str(scratch / '.config'), HOME=str(self.root))
+        result = self.invoke('config', 'show', env=dict(env, HOME=str(scratch)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(result.stdout)['config']['pools']), {'runtime', 'heavy'})
+        result = subprocess.run([str(TOOL), 'run', '--pool', 'heavy', '--kind', 'build',
+                                 '--campaign', 'scratch', '--purpose', 'test', '--task', 'test-task', '--',
+                                 'env', f'HOME={scratch}', f'TASKR_DB={scratch / "taskr.db"}',
+                                 sys.executable, '-c',
+                                 'import json,os; print(json.dumps({k:os.environ[k] for k in '
+                                 '("HOME","TASKR_DB","XDG_RUNTIME_DIR","SLOTR_POOL")}))'],
+                                env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('slotr: admitted slotr-heavy-1', result.stderr)
+        self.assertEqual(json.loads(result.stdout), dict(HOME=str(scratch), TASKR_DB=str(scratch / 'taskr.db'),
+                                                       XDG_RUNTIME_DIR=str(self.runtime), SLOTR_POOL='heavy'))
+        state = json.loads((self.runtime / 'slotr/state.json').read_text())
+        self.assertEqual(state['enqueue_seq'], 1)
+        self.assertEqual(state['queue'], [])
+        self.assertEqual(len(state['holders']), 1)
+        self.assertEqual(state['holders'][0]['pool'], 'heavy')
+        self.assertEqual(state['holders'][0]['level'], 3)
+        self.assertEqual(state['holders'][0]['cost_mib'], 6144)
+        self.assertEqual(len((self.runtime / 'launches').read_text().splitlines()), 1)
+        admits = self.events('admit')
+        self.assertEqual(len(admits), 1)
+        self.assertEqual(admits[0]['pool'], 'heavy')
+        self.assertEqual(admits[0]['cost_mib'], 6144)
+        result = self.invoke('status', '--json', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['priority']['state'], 'ok')
+        self.assertTrue(priority.exists())
+        self.assertFalse((scratch / '.config/slotr').exists())
 
     def test_stop_only_registered_unit_and_test_seams_gated(self):
         self.assertEqual(self.invoke("stop", "unrelated.service").returncode, 2)

@@ -84,7 +84,7 @@ configured `pools` table replaces the built-in `default` pool, so
 `slotr config show`.
 
 **`unknown kind: NAME`.** `--kind` names a kind the pool does not define
-under `kinds`.
+under `kinds`. The error lists that pool's valid kinds, or `none`.
 
 **`campaign must not be empty` or `purpose must not be empty`.** Pass
 nonempty `--campaign` and `--purpose` text.
@@ -128,9 +128,11 @@ name the bad key, for example:
 - `config watchdog.on_pressure: expected stop, warn or off`, and the same for
   `lease.on_expiry`
 - `config pools: at least one pool required`
+- `config path must not be empty` for an empty explicit config path
 - `config KEY: invalid environment value` for a bad `SLOTR_...__...`
   override
 
 `config check FILE` fails when FILE does not exist, with
-`config FILE: No such file or directory`. Without FILE, a missing config is
-fine and the defaults apply.
+`config FILE: No such file or directory`. Without FILE, a missing default
+config is fine and the defaults apply; a missing or empty `SLOTR_CONFIG`
+exits 2.

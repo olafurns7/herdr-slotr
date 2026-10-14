@@ -29,7 +29,14 @@ pub fn run(args: Run, cfg: &Config) -> Result<i32> {
     let cost = if let Some(kind) = &args.kind {
         pool.kinds
             .get(kind)
-            .ok_or_else(|| anyhow::anyhow!("unknown kind: {kind}"))?
+            .ok_or_else(|| {
+                let valid = pool.kinds.keys().cloned().collect::<Vec<_>>().join(", ");
+                anyhow::anyhow!(
+                    "unknown kind: {kind} (pool {}; valid kinds: {})",
+                    args.pool,
+                    if valid.is_empty() { "none" } else { &valid }
+                )
+            })?
             .cost_mib
     } else {
         args.cost.unwrap_or(pool.default_cost_mib)
