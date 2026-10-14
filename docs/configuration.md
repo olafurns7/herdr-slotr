@@ -5,7 +5,9 @@ This file explains where slotr reads its config, how to check it, and what every
 ## Where the config lives
 
 slotr reads `${XDG_CONFIG_HOME:-~/.config}/slotr/config.toml`, or the path in
-`SLOTR_CONFIG`. A missing config uses the built-in defaults below.
+`SLOTR_CONFIG`. Only a missing default discovered path uses the built-in
+defaults below. An explicitly set `SLOTR_CONFIG` must name a readable file;
+a missing file or an empty value exits 2.
 `config.example.toml` in this repository is the built-in default
 configuration; copy it to start your own. `examples/devbox.toml` is a larger
 example with a `runtime` pool, a `heavy` pool for one-shot commands, ports,
@@ -20,7 +22,8 @@ slotr config show
 ```
 
 - `config check` loads the config and prints `slotr: config OK`.
-  `config check FILE` checks that file instead, and requires it to exist.
+  `config check FILE` checks that file instead, takes precedence over
+  `SLOTR_CONFIG` (even an empty or missing path), and requires FILE to exist.
 - `config show` emits JSON containing effective values and each value's
   source: `default`, `file`, or `env`.
 
@@ -73,12 +76,22 @@ These tables match `config.example.toml`. Durations use the suffixes `s`,
 Optional port tables default to base 31000, stride 32, and probe 7 when
 enabled. A legacy lock requires a path; its mode defaults to `shared`.
 
+Kinds belong to each pool; they are not global aliases. The example `heavy`
+pool defines `tsc`, `oxlint`, `vitest`, `build`, and `install`. Select only
+kinds defined in your chosen pool. Unknown kinds exit 2 and list that pool's
+configured keys, or `none` when it has no kinds.
+
 ### Priority
 
 | Priority key (`priority`) | Default | Meaning |
 | --- | --- | --- |
 | `campaigns` | `[]` | Exact campaign names or prefixes ending in `*`; matches get level 1 |
 | `file` | `""` | Optional level file; empty disables it; `~` expands to the home directory |
+
+`~` and `~/` use the slotr process's `HOME`, including when `SLOTR_CONFIG`
+is absolute. Use an absolute priority file path when it must remain fixed
+across changes to that home directory. Other relative paths use the working
+directory.
 
 The file uses one rule per line:
 

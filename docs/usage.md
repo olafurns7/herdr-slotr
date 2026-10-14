@@ -44,7 +44,8 @@ slotr --version
 - `--pool NAME` selects the pool. The default is `default`.
 - `--kind NAME` selects a configured cost, or `--cost MIB` supplies it
   directly. Otherwise the pool's `default_cost_mib` applies. You cannot pass
-  both `--kind` and `--cost`.
+  both `--kind` and `--cost`. Kinds are per-pool; an unknown name exits 2
+  before admission and lists the selected pool's valid keys (or `none`).
 - `--lease 30m` requests a shorter lease; the pool's `max_lease` caps it.
   Duration suffixes are `s`, `m`, `h`, and `d`; a bare number is seconds and
   `"0"` means unlimited.
@@ -99,6 +100,28 @@ priority runtime.
 slotr run --pool heavy --kind tsc --campaign team-a --purpose "type check" \
   -- pnpm tsc --noEmit
 ```
+
+The example heavy kinds are `tsc`, `oxlint`, `vitest`, `build`, and `install`.
+For Cargo checks on a host with that configuration, use `--kind build`.
+`tests` and `lint` are not aliases and are rejected unless your pool
+explicitly defines them.
+
+For checks needing a scratch home or taskr database, keep slotr's outer
+`HOME` and `XDG_RUNTIME_DIR` set to the real host values. Pin its config with
+an absolute path and put the scratch variables after `--`:
+
+```sh
+SLOTR_CONFIG=/absolute/slotr/config.toml slotr run --pool heavy --kind build \
+  --campaign team-a --purpose "isolated checks" \
+  --task 123 --pane "$HERDR_PANE_ID" \
+  -- env HOME=/scratch/home TASKR_DB=/scratch/taskr.db cargo test --locked
+```
+
+This keeps admission and supervision on the host config and queue while
+the payload uses the scratch variables. Changing the outer `XDG_RUNTIME_DIR`
+would select a different queue. An absolute config path does not pin a
+`~/` priority file: it still follows slotr's `HOME`; use an absolute priority
+path when needed. Keep task and pane identity for hooks and task priority.
 
 - Output and the exit code pass through, and the working directory is kept.
   A script reads the result as it would without slotr.

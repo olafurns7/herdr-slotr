@@ -277,8 +277,13 @@ pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
     let mut sources = BTreeMap::new();
     let path = file
         .map(Path::to_path_buf)
-        .or_else(|| env::var_os("SLOTR_CONFIG").map(PathBuf::from))
-        .unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("slotr/config.toml"));
+        .or_else(|| env::var_os("SLOTR_CONFIG").map(PathBuf::from));
+    let explicit = path.is_some();
+    let path = path.unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("slotr/config.toml"));
+    ensure!(
+        !path.as_os_str().is_empty(),
+        "config path must not be empty"
+    );
     match fs::read_to_string(&path) {
         Ok(text) => {
             let custom: Value =
@@ -288,7 +293,7 @@ pub fn load(file: Option<&Path>) -> Result<(Config, BTreeMap<String, String>)> {
             }
             merge(&mut value, custom, "", "file", &mut sources)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && file.is_none() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {}
         Err(e) => return Err(e).with_context(|| format!("config {}", path.display())),
     }
     for (key, raw) in env::vars_os()
