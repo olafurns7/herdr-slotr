@@ -1,47 +1,19 @@
-# slotr
+# slotr (archived)
 
-slotr is a queue for heavy commands on one Linux machine, such as dev
-servers and test stacks. `slotr run` waits for a free slot and enough free
-memory, then runs your command in its own
-[systemd user service](docs/install.md#requirements). When memory runs low,
-slotr can stop the lowest-priority evictable command, newest first within a
-priority level, and it can reclaim a run past its lease when another
-campaign waits. This lowers the risk of running out
-of memory but does not remove it.
+This repository is archived. slotr now lives in
+[herdr-kit](https://github.com/olafurns7/herdr-kit), under
+[`products/slotr`](https://github.com/olafurns7/herdr-kit/tree/main/products/slotr).
+Open new issues and pull requests there.
 
-## Quick install
+## Releases
 
-```sh
-curl -fsSL https://github.com/olafurns7/herdr-slotr/releases/latest/download/install.sh | sh
-```
+New slotr releases are published on herdr-kit with `slotr/vX.Y.Z` tags. The
+current release is
+[`slotr/v0.3.1`](https://github.com/olafurns7/herdr-kit/releases/tag/slotr%2Fv0.3.1).
+To install, follow
+[slotr's install guide](https://github.com/olafurns7/herdr-kit/blob/main/products/slotr/docs/install.md).
 
-Downloads the release for Linux x86_64, verifies its checksum, and installs to `~/.local/bin`.
-
-Prefer to check first?
-
-```sh
-curl -fsSL https://github.com/olafurns7/herdr-slotr/releases/latest/download/install.sh -o install.sh
-cat install.sh
-sh install.sh
-```
-
-## Quick agent setup
-
-```sh
-curl -fsSL https://github.com/olafurns7/herdr-slotr/releases/latest/download/install.sh | sh -s -- --config
-```
-
-Also creates the config from the example when none exists, then checks it.
-
-## Documentation
-
-- [Install](docs/install.md)
-- [Agent setup](docs/agent-setup.md)
-- [Usage](docs/usage.md)
-- [Cooperative flock guard](docs/flock.md)
-- [Configuration](docs/configuration.md)
-- [How it works](docs/how-it-works.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Validate and release](docs/release.md)
-
-Licence: [MIT](LICENSE). [Third-party notices](THIRD-PARTY-NOTICES) ship in the release archive.
+The old releases (v0.1.0 through v0.2.0) remain downloadable from
+[this repository's releases page](https://github.com/olafurns7/herdr-slotr/releases).
+They receive no updates. This repository's `releases/latest` install URL
+still installs v0.2.0.
